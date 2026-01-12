@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional, Set
 
 import numpy as np
-from utils.buckets import equal_mass_buckets, bucket_index
+from fl_utils.buckets import equal_mass_buckets, bucket_index
 
 
 def _logit(p: float, eps: float = 1e-6) -> float:

@@ -2,7 +2,7 @@
 from typing import List, Dict, Any, Tuple
 import numpy as np
 from .dr import GraphAwareDR
-from utils.buckets import equal_mass_buckets
+from fl_utils.buckets import equal_mass_buckets
 
 _SCORE_KEYS = ("p_hat", "p", "score", "prob", "s")
 

@@ -55,7 +55,7 @@ def main():
     # init bucket edges for groups (needed for apply())
     groups = sorted(set(int(g) for g in nodes["group"].unique() if int(g) >= 0))
     # start with uniform buckets in [0,1]
-    from utils.buckets import equal_mass_buckets
+    from fl_utils.buckets import equal_mass_buckets
     auditor.edges_by_group = {g: equal_mass_buckets(np.linspace(0,1,1001), auditor_cfg.buckets_per_group) for g in groups}
     # make all auditors active at start (otherwise apply() does nothing)
     auditor.active_set.active_auditors = set((g, b) for g in groups for b in range(auditor_cfg.buckets_per_group))

@@ -1,0 +1,9 @@
+{
+  "dataset": "tgb",
+  "model": "EdgeBank",
+  "T": 50000,
+  "neg": 200,
+  "hits_k": 10,
+  "seed": 42,
+  "tgb_root": "/data1/shengen/fairlink/tgb_baselines"
+}

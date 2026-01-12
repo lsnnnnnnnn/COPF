@@ -1,0 +1,14 @@
+{
+  "num_nodes": 352638,
+  "emb_dim": 128,
+  "msg_dim": 128,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "device": "cuda",
+  "train_every": 1,
+  "adv_lambda": 0.0,
+  "n_groups": 0,
+  "reweight": "none",
+  "fair_penalty_lambda": 0.0,
+  "seed": 42
+}
