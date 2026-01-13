@@ -95,10 +95,19 @@ class OnlineCrossFitter:
         
         return np.array(features)
     
-    def update(self, cands: List[Dict[str, Any]]):
+    def update(self, cands: List[Dict[str, Any]], train: bool = True):
         """
         Update nuisance models with new batch
         Implements online cross-fitting protocol
+
+        Parameters
+        ----------
+        cands:
+            New candidate batch to ingest into the training buffer.
+        train:
+            If False, this call only ingests into the FIFO buffer and returns
+            (useful to amortize expensive re-training). If True, this call
+            ingests and then fits/refreshes the nuisance models.
         """
         if not cands:
             return
@@ -117,6 +126,10 @@ class OnlineCrossFitter:
         
         # Need minimum data before training
         if len(self.buffer) < max(100, self.n_folds * 20):
+            return
+
+        # Optionally skip expensive re-training (buffer ingestion already done).
+        if not train:
             return
         
         # Prepare training data

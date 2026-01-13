@@ -165,7 +165,7 @@ class GraphAwareDR:
                 'w_local': w_local,
                 
                 # Counterfactual residuals (Section 6)
-                'r0': r0, 'r_delta': r_delta, 'tau_x': tau_x
+                'r0': r0, 'r_delta': r_delta, 'tau_x': tau_x, 'x': c.get('x', {}) 
             }
             
             self.buffer.append(item)
