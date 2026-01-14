@@ -24,8 +24,7 @@
     "ratio_stab": true,
     "winsor_eps": 0.02,
     "min_eff_samples": 100,
-    "tau_mode": "zero",
-    "tau_const": 0.0
+    "tau_target": 0.0
   },
   "aud_cfg": {
     "buckets_per_group": 10,

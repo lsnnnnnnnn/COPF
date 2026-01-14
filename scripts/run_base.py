@@ -22,7 +22,10 @@ import torch.nn as nn
 # Paths
 # ---------------------------------------------------------------------
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DEFAULT_TGB_ROOT = os.path.join(REPO_ROOT, "tgb_baselines")
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+DEFAULT_TGB_ROOT = os.environ.get("TGB_BASELINES", os.path.join(REPO_ROOT, "tgb_baselines"))
 
 
 def _ensure_dir(p: str) -> None:
@@ -507,6 +510,65 @@ def _build_group_map_from_nodes(nodes: Optional[pd.DataFrame]) -> Tuple[Dict[int
     return gm, ng
 
 
+def _build_tgb_group_map(
+    edges: pd.DataFrame,
+    num_nodes: int,
+    mode: str = "none",
+    n_groups: int = 2,
+    warmup: int = 20000,
+) -> Tuple[Dict[int, int], int, List[int]]:
+    """Build a *synthetic* protected-group map for TGB datasets.
+
+    TGB datasets do not ship with a protected attribute in this repo. For experiments that need
+    groups (e.g., TGN adversarial debiasing / penalty baselines, and OPP-COPF fairness metrics),
+    we optionally create groups from node IDs or simple structural stats.
+
+    Modes:
+      - none: every node in group 0
+      - src_mod: group(u) = u % n_groups
+      - src_degree: degree bucket of src node based on a warmup prefix
+
+    Returns: (group_map, n_groups_found, groups_list)
+    """
+    mode = str(mode).lower().strip()
+    if mode == "none":
+        return {}, 0, [0]
+
+    n_groups = max(2, int(n_groups))
+
+    # Default: deterministic mapping by src id
+    if mode == "src_mod":
+        gm = {int(u): int(u) % n_groups for u in range(int(num_nodes))}
+        return gm, n_groups, list(range(n_groups))
+
+    # Degree-bucket mapping using a warmup prefix
+    if mode == "src_degree":
+        warmup = max(1, int(warmup))
+        prefix = edges.iloc[: min(warmup, len(edges))]
+        deg = np.zeros(int(num_nodes), dtype=np.int64)
+        for r in prefix.itertuples(index=False):
+            u = int(getattr(r, "src"))
+            if 0 <= u < num_nodes:
+                deg[u] += 1
+
+        # bucket by quantiles into n_groups
+        qs = np.quantile(deg, np.linspace(0, 1, n_groups + 1))
+        # make monotone / unique edges
+        qs = np.unique(qs)
+        if len(qs) <= 2:
+            gm = {int(u): int(u) % n_groups for u in range(int(num_nodes))}
+            return gm, n_groups, list(range(n_groups))
+
+        def bucket(d: int) -> int:
+            # find rightmost q <= d
+            b = int(np.searchsorted(qs[1:], d, side="right"))
+            return int(np.clip(b, 0, n_groups - 1))
+
+        gm = {int(u): bucket(int(deg[u])) for u in range(int(num_nodes))}
+        return gm, n_groups, list(range(n_groups))
+
+    raise ValueError(f"Unknown --tgb_group_mode '{mode}'.")
+
 def _rank_of_positive(v_list: np.ndarray, scores: np.ndarray, v_pos: int) -> int:
     order = np.lexsort((v_list, -scores))
     sorted_vs = v_list[order]
@@ -536,6 +598,13 @@ def main() -> None:
     ap.add_argument("--n_users", type=int, default=-1)
 
     ap.add_argument("--tgb_root", type=str, default=DEFAULT_TGB_ROOT)
+    # synthetic group definition for TGB (needed for adv/penalty fairness baselines)
+    ap.add_argument("--tgb_group_mode", type=str, default="none", choices=["none", "src_mod", "src_degree"],
+                    help="How to create protected groups on TGB when none are provided.")
+    ap.add_argument("--tgb_group_n", type=int, default=2, help="Number of groups for TGB synthetic grouping.")
+    ap.add_argument("--tgb_group_warmup", type=int, default=20000,
+                    help="Warmup prefix length for src_degree grouping (quantile buckets).")
+
 
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=0.0)
@@ -582,9 +651,10 @@ def main() -> None:
         if not args.tgb_edgelist:
             raise ValueError("--tgb_edgelist is required when --dataset tgb")
         edges = _load_tgb_csv(args.tgb_edgelist)
-        group_map = {}
-        n_groups_found = 0
         num_nodes = _infer_num_nodes(edges)
+        group_map, n_groups_found, _ = _build_tgb_group_map(
+            edges, num_nodes, mode=args.tgb_group_mode, n_groups=args.tgb_group_n, warmup=args.tgb_group_warmup
+        )
         n_users = -1
 
     T = min(int(args.T), len(edges))

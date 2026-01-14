@@ -163,9 +163,12 @@ class GraphAwareDR:
                 
                 # Locality weight (Definition 1)
                 'w_local': w_local,
+                # Time-decay gamma for GA weights (used by OI auditing to match GA-DR weighting)
+                'ga_gamma': float(self.cfg.decay_gamma),
+
                 
                 # Counterfactual residuals (Section 6)
-                'r0': r0, 'r_delta': r_delta, 'tau_x': tau_x, 'x': c.get('x', {}) 
+                'r0': r0, 'r_delta': r_delta, 'tau_x': tau_x
             }
             
             self.buffer.append(item)
@@ -359,6 +362,7 @@ class GraphAwareDR:
             diag['cross_fitter'] = cf_diag
         
         return diag
+
 
 
 

@@ -1,0 +1,366 @@
+"""
+Graph-Aware Doubly Robust Estimation (GA-DR)
+Implements Definition 1 and Section 5 from the paper.
+
+This file is intentionally self-contained and lightweight so it can be used by
+the online runners in `scripts/run_copf.py` and the fairness metrics in
+`copf/fairness.py`.
+
+Important alignment detail (paper vs. early prototype):
+------------------------------------------------------
+GA-DR uses *a single global weighting measure* (locality weights + optional
+time-decay).  For fairness metrics (gTE/gCal) and Residual-OI certificates to be
+comparable, **all expectations must use the same GA weights**.
+
+Earlier versions of this repo computed time-decay using a slice-local `t_max`,
+which made the effective measure depend on which slice you queried.  That can
+cause certificates and metrics to disagree.
+
+This implementation fixes that by:
+  - maintaining a global round counter `t_round` (incremented once per ingest batch)
+  - storing `t_round` in every buffer item
+  - computing time-decay relative to the *global* latest round
+
+We also expose a `tau_target` in DRConfig, used by the counterfactual residual
+`r_delta`.  For the gTE gap certificate (Theorem/Corollary in the draft), you
+typically want `tau_target = 0.0`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Tuple
+
+import numpy as np
+
+
+def winsorize01(x: np.ndarray, eps: float = 0.02) -> np.ndarray:
+    """Winsorize to [eps, 1-eps] for stability."""
+    lo, hi = float(eps), float(1.0 - eps)
+    return np.clip(x, lo, hi)
+
+
+def ratio_stabilize(r: np.ndarray) -> np.ndarray:
+    """Stabilize ratios to prevent explosion."""
+    return r / (1.0 + np.abs(r))
+
+
+@dataclass
+class DRConfig:
+    # Overlap clipping for propensities
+    clip: float = 0.05
+
+    # Use the self-normalized GA-DR estimator (Definition 1)
+    self_normalized: bool = True
+
+    # Optional time-decay for GA weights (Definition 1: w_t)
+    decay_gamma: float = 0.0
+
+    # Buffer size
+    max_buffer: int = 200000
+
+    # Stabilize importance ratios
+    ratio_stab: bool = True
+
+    # Winsorization for stability
+    winsor_eps: float = 0.02
+
+    # Minimum effective samples required to return a non-zero estimate
+    min_eff_samples: int = 100
+
+    # Target treatment effect used in r_delta residual (for TE-gap certificate)
+    tau_target: float = 0.0
+
+
+class GraphAwareDR:
+    """Graph-Aware Doubly Robust estimator with locality weights."""
+
+    def __init__(self, config: DRConfig, cross_fitter=None, neighborhood_tracker=None):
+        self.cfg = config
+        self.buffer: List[Dict[str, Any]] = []
+        self.cross_fitter = cross_fitter
+        self.neighborhood_tracker = neighborhood_tracker
+
+        # global round counter: increments once per ingest batch
+        self.t: int = 0
+
+    # --------------------------
+    # utilities
+    # --------------------------
+    def _clip_propensity(self, e: float) -> float:
+        e = float(e)
+        lo = float(self.cfg.clip)
+        hi = float(1.0 - self.cfg.clip)
+        return float(np.clip(e, lo, hi))
+
+    # --------------------------
+    # online ingest
+    # --------------------------
+    def ingest(self, cands: List[Dict[str, Any]]) -> None:
+        """Process a batch of candidates and compute GA-DR plug-ins.
+
+        This corresponds to the OPP-style update: we ingest *all* candidates from
+        the current round (the logged exposure is identified by d=1).
+        """
+        if not cands:
+            self.t += 1
+            return
+
+        # global round id for this batch (used for cross-fitting + time decay)
+        t_round = int(self.t)
+
+        for c in cands:
+            # Base score (probability in (0,1) is recommended, but we don't enforce here)
+            p = float(c.get("p_hat", 0.5))
+
+            # Logged propensity for the chosen action (filled by `copf/propensity.py`)
+            e_logged = float(c.get("e_hat", 0.5))
+
+            # Treatment and observed outcome
+            d = int(c.get("d", 0))
+            y_obs = float(c.get("y", 0.0))
+
+            # IDs / group
+            u = int(c.get("u", -1))
+            v = int(c.get("v", -1))
+            a = c.get("a", 0)
+
+            # Dataset timestamp (kept for debugging only)
+            t_data = c.get("t", t_round)
+
+            # --------------------
+            # cross-fitted nuisance estimates
+            # --------------------
+            if self.cross_fitter is not None:
+                # IMPORTANT: pass the *round index*, not raw dataset timestamp,
+                # so folds are consistent with the online order.
+                mu0 = float(self.cross_fitter.predict_outcome(c, arm=0, t=t_round))
+                mu1 = float(self.cross_fitter.predict_outcome(c, arm=1, t=t_round))
+                e1 = float(self.cross_fitter.predict_propensity(c, t=t_round))
+            else:
+                # Fallback: use logged propensity + simple mu plugs
+                e1 = e_logged
+                mu0 = float(c.get("mu0_hat", p))
+                mu1 = float(c.get("mu1_hat", min(1.0, max(0.0, p * 1.2))))
+
+            # Clip propensity for overlap stability
+            e1 = self._clip_propensity(e1)
+            e0 = 1.0 - e1
+
+            # --------------------
+            # locality weight
+            # --------------------
+            if self.neighborhood_tracker is not None and isinstance(c, dict) and ("u" in c) and ("v" in c):
+                try:
+                    w_local = float(
+                        self.neighborhood_tracker.compute_locality_weight(
+                            int(c["u"]), int(c["v"]), int(t_round)
+                        )
+                    )
+                except Exception:
+                    w_local = 1.0
+            else:
+                # runner can pass w_local (preferred) or locality_weight
+                w_local = float(c.get("w_local", c.get("locality_weight", 1.0)))
+
+            # --------------------
+            # GA-DR scores (Definition 1)
+            # Γ^(a) = μ_a + 1{D=a}/ê_a * (Y - μ_a)
+            # --------------------
+            if d == 0:
+                gamma_0 = mu0 + (1.0 / max(1e-12, e0)) * (y_obs - mu0)
+                if self.cfg.ratio_stab:
+                    gamma_0 = mu0 + float(ratio_stabilize(np.array([(y_obs - mu0) / max(1e-12, e0)]))[0])
+            else:
+                gamma_0 = mu0
+
+            if d == 1:
+                gamma_1 = mu1 + (1.0 / max(1e-12, e1)) * (y_obs - mu1)
+                if self.cfg.ratio_stab:
+                    gamma_1 = mu1 + float(ratio_stabilize(np.array([(y_obs - mu1) / max(1e-12, e1)]))[0])
+            else:
+                gamma_1 = mu1
+
+            # Winsorize to keep numbers stable
+            gamma_0 = float(winsorize01(np.array([gamma_0]), eps=self.cfg.winsor_eps)[0])
+            gamma_1 = float(winsorize01(np.array([gamma_1]), eps=self.cfg.winsor_eps)[0])
+            mu0 = float(winsorize01(np.array([mu0]), eps=self.cfg.winsor_eps)[0])
+            mu1 = float(winsorize01(np.array([mu1]), eps=self.cfg.winsor_eps)[0])
+
+            # --------------------
+            # residuals for Residual-OI auditing (Section 6)
+            # --------------------
+            # r0 = Y^(0) - score
+            r0 = float(gamma_0 - p)
+
+            # rΔ = (Y^(1) - Y^(0)) - τ_target
+            tau_x = float(self.cfg.tau_target)
+            r_delta = float((gamma_1 - gamma_0) - tau_x)
+
+            item: Dict[str, Any] = {
+                # identifiers
+                "u": u,
+                "v": v,
+                "t": t_data,
+                "t_round": t_round,
+                "a": a,
+
+                # scores / props
+                "p_hat": p,
+                "e_hat": e_logged,
+                "e_cf": e1,
+
+                # treatment / outcome
+                "d": d,
+                "y": y_obs,
+
+                # nuisance
+                "mu0_hat": mu0,
+                "mu1_hat": mu1,
+
+                # GA-DR scores
+                "gamma_0": gamma_0,
+                "gamma_1": gamma_1,
+
+                # GA weights
+                "w_local": w_local,
+                "decay_gamma": float(self.cfg.decay_gamma),
+
+                # features for kernel auditors (if provided)
+                "x": c.get("x", {}),
+
+                # residuals
+                "r0": r0,
+                "r_delta": r_delta,
+                "tau_x": tau_x,
+            }
+
+            self.buffer.append(item)
+
+        # Maintain buffer size
+        if len(self.buffer) > int(self.cfg.max_buffer):
+            self.buffer = self.buffer[-int(self.cfg.max_buffer):]
+
+        # advance global round
+        self.t += 1
+
+    # --------------------------
+    # GA weights
+    # --------------------------
+    def _weights(self, items: List[Dict[str, Any]]) -> np.ndarray:
+        """Compute combined GA weights: locality * time_decay.
+
+        IMPORTANT: time decay is computed relative to a global reference round,
+        not a slice-local max timestamp, so the measure is consistent across slices.
+        """
+        n = len(items)
+        if n == 0:
+            return np.zeros(0, dtype=float)
+
+        # Locality weights
+        w_local = np.array([float(i.get("w_local", 1.0)) for i in items], dtype=float)
+
+        # Time decay weights
+        if float(self.cfg.decay_gamma) > 0.0:
+            # last completed round is (self.t - 1)
+            t_ref = max(0, int(self.t) - 1)
+            gamma = float(self.cfg.decay_gamma)
+            w_time = np.array(
+                [np.exp(-gamma * max(0, t_ref - int(i.get("t_round", 0)))) for i in items],
+                dtype=float,
+            )
+        else:
+            w_time = np.ones(n, dtype=float)
+
+        return w_local * w_time
+
+    # --------------------------
+    # estimators used by fairness metrics
+    # --------------------------
+    def estimate_EY(self, cond: Callable[[Dict[str, Any]], bool], arm: int) -> Tuple[float, int]:
+        """Estimate E[Y^(arm) | cond] using GA-DR.
+
+        Returns (estimate, n_raw) where n_raw is the number of items satisfying cond.
+        """
+        S = [c for c in self.buffer if cond(c)]
+        n = len(S)
+        if n < int(self.cfg.min_eff_samples):
+            return 0.0, 0
+
+        w = self._weights(S)
+
+        if arm == 0:
+            gamma = np.array([float(c["gamma_0"]) for c in S], dtype=float)
+        else:
+            gamma = np.array([float(c["gamma_1"]) for c in S], dtype=float)
+
+        if bool(self.cfg.self_normalized):
+            denom = float(np.sum(w))
+            est = float(np.sum(w * gamma) / denom) if denom > 0 else 0.0
+        else:
+            est = float(np.mean(gamma))
+
+        est = float(winsorize01(np.array([est]), eps=self.cfg.winsor_eps)[0])
+        return est, n
+
+    def estimate_Y0(self, c: Dict[str, Any]) -> float:
+        """Estimate Y^(0) for a single candidate (used by some auditors)."""
+        return float(c.get("gamma_0", c.get("mu0_hat", 0.5)))
+
+    def estimate_Y1(self, c: Dict[str, Any]) -> float:
+        """Estimate Y^(1) for a single candidate."""
+        return float(c.get("gamma_1", c.get("mu1_hat", 0.5)))
+
+    def estimate_TE_by_group(self, group_key: str = "a") -> Dict[Any, Tuple[float, int]]:
+        """Estimate τ_s = E[Y^(1)-Y^(0) | A=s] for each group."""
+        groups = sorted(list({c.get(group_key) for c in self.buffer}))
+        results: Dict[Any, Tuple[float, int]] = {}
+        for s in groups:
+            def cond_s(c, s=s):
+                return c.get(group_key) == s
+
+            ey1, n1 = self.estimate_EY(cond_s, arm=1)
+            ey0, n0 = self.estimate_EY(cond_s, arm=0)
+            n = min(n1, n0)
+            te = float(ey1 - ey0) if n > 0 else 0.0
+            results[s] = (te, n)
+        return results
+
+    def get_residual_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return arrays of r0 and r_delta from the buffer."""
+        if not self.buffer:
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        r0 = np.array([float(c.get("r0", 0.0)) for c in self.buffer], dtype=float)
+        r_delta = np.array([float(c.get("r_delta", 0.0)) for c in self.buffer], dtype=float)
+        return r0, r_delta
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        diag: Dict[str, Any] = {
+            "buffer_size": int(len(self.buffer)),
+            "t_round": int(self.t),
+            "decay_gamma": float(self.cfg.decay_gamma),
+            "tau_target": float(self.cfg.tau_target),
+        }
+        if self.buffer:
+            r0, rD = self.get_residual_arrays()
+            diag["r0_mean"] = float(np.mean(r0))
+            diag["r0_std"] = float(np.std(r0))
+            diag["r_delta_mean"] = float(np.mean(rD))
+            diag["r_delta_std"] = float(np.std(rD))
+
+        if self.cross_fitter is not None and hasattr(self.cross_fitter, "get_model_diagnostics"):
+            try:
+                diag["cross_fitter"] = self.cross_fitter.get_model_diagnostics()
+            except Exception:
+                pass
+
+        return diag
+
+
+
+
+
+
+
+
+

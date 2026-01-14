@@ -23,9 +23,7 @@
     "max_buffer": 200000,
     "ratio_stab": true,
     "winsor_eps": 0.02,
-    "min_eff_samples": 100,
-    "tau_mode": "zero",
-    "tau_const": 0.0
+    "min_eff_samples": 100
   },
   "aud_cfg": {
     "buckets_per_group": 10,

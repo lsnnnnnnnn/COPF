@@ -1,398 +1,604 @@
 """copf/oi_audit.py
 
-Residual-OI auditing utilities + simple noisy-transfer certificates.
+Residual-OI auditing for COPF.
 
-This module is *evaluation/auditing* only: it does not change model scores.
+This module provides:
+  - OIAuditConfig: configuration for discrete (bucketed) + optional RFF (RKHS) auditors.
+  - ResidualOIAuditor: the main interface used by scripts/run_copf.py.
 
-It aligns with:
-  - Definition 2 (Residual OI on auditor class H)
-  - Theorem 1 / Corollary 1 (noisy transfer to counterfactual gaps)
-in the draft PDF.
+Paper-alignment notes (COPF / Residual-OI):
+  * We audit residual opportunity imbalance over *slices* S ⊆ X × A × R:
+      - A: protected attribute / group
+      - score buckets (within group)
+      - optional structural roles / coarse structure features
+  * When GA (graph-aware) weights are used (w_local + time decay),
+    ALL expectations in the auditor are computed as GA-weighted self-normalized means:
+        E_GA[f] = (Σ w_i f_i) / (Σ w_i)
 
-We implement two practical auditor families:
-  (1) Discrete slice auditors: group-only and group×score-bucket (optionally + structural bins)
-  (2) Any-kernel auditors: RBF RKHS approximated with Random Fourier Features (RFF)
+Important runner compatibility detail:
+-------------------------------------
+`scripts/run_copf.py` calls:
+    oi_auditor.audit(dr_phase.buffer, groups=groups_list)
 
-The returned epsilons are computed on DR plug-in residuals (r0 / r_delta) stored in GraphAwareDR.buffer.
+where `groups_list` is typically the *set of group IDs* (e.g., [0,1]),
+NOT a per-item group vector.
+
+This auditor therefore supports BOTH:
+  (a) groups=None                     -> infer group of each item from item['a']
+  (b) groups=[0,1,...] (small list)   -> treat as allowed group IDs (filter)
+  (c) groups=per_item_vector (len==len(buffer) or len==len(window)) -> override per-item groups
+
+Implementation details:
+  * equal_mass_buckets() in this repo returns bucket *intervals*: [(lo, hi), ...].
+    Do NOT cast them to floats. Use bucket_index(intervals, value).
+
+Expected fields in each DR buffer item (dict-like):
+  - 'a'      : group id (int)
+  - 'p_hat'  : base score/prob (float)
+  - 'r0'     : residual for calibration gap (float)
+  - 'r_delta': residual for treatment-effect gap (float)
+  - 'w_local': optional locality weight (float, default 1.0)
+  - 'ga_gamma' or 'decay_gamma': optional time-decay gamma (float, default 0.0)
+  - 't_round' or 't': time index used for decay (int/float)
+
+This file is meant to live at:
+  fairlink/copf/oi_audit.py
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import math
+from collections import defaultdict
 
 import numpy as np
 
-from fl_utils.buckets import equal_mass_buckets, bucket_index
+from fl_utils.buckets import bucket_index, equal_mass_buckets
 
 
-def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def _log1p_nonneg(x: float) -> float:
-    return float(np.log1p(max(0.0, float(x))))
-
-
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 @dataclass
 class OIAuditConfig:
-    # Discrete auditors
+    # Sliding window length over the DR buffer (0 or None => use whole buffer)
+    window: int = 40000
+
+    # Discrete auditors: score buckets per group
     buckets_per_group: int = 10
-    min_mass: float = 0.02
-    include_group_only: bool = True
-    include_group_bucket: bool = True
+    min_mass: float = 1e-3  # min slice mass; slices smaller than this are ignored
 
-    # Optional structural auditors (still discrete): group×bucket×(feature-bin)
-    struct_features: Tuple[str, ...] = ("degree_u", "degree_v", "time_since_last")
-    struct_bins: int = 5
+    # Which discrete slice families to include
+    include_group_only: bool = True         # slices keyed by group only
+    include_group_bucket: bool = True       # slices keyed by (group, score-bucket)
+
+    # Optional structural / feature bucket auditors (augment gb slices)
     include_struct: bool = False
+    struct_bins: int = 5
 
-    # Any-kernel (RKHS) auditors via RFF
+    # Keep only the top-B violating slices in diagnostics (does NOT affect eps calculation)
+    budget_B: int = 64
+
+    # Any-kernel auditor via Random Fourier Features (RBF)
     rff_dim: int = 0
     rff_gamma: float = 1.0
-    seed: int = 0
 
-    # How many recent DR items to use for auditing (0 => use full buffer)
-    window: int = 50000
+    # Confidence level for (simple) concentration bounds
+    delta: float = 0.05
 
-    # Just for reporting top violated discrete auditors
-    budget_B: int = 50
+    # Internal random seed
+    seed: int = 123
+
+    # Whether to use GA weights (w_local + time-decay). Keep True for paper alignment.
+    use_ga_weights: bool = True
 
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def _effective_n(w: np.ndarray) -> float:
+    """Kish effective sample size for nonnegative weights."""
+    w = np.asarray(w, dtype=float)
+    s1 = float(w.sum())
+    s2 = float(np.sum(w * w))
+    if s2 <= 0.0:
+        return 0.0
+    return (s1 * s1) / s2
+
+
+def _get_gamma(items: Sequence[Dict[str, Any]]) -> float:
+    if not items:
+        return 0.0
+    g = items[0].get("ga_gamma", items[0].get("decay_gamma", 0.0))
+    try:
+        g = float(g)
+    except Exception:
+        g = 0.0
+    if not np.isfinite(g) or g <= 0.0:
+        return 0.0
+    return g
+
+
+def _get_time_key(items: Sequence[Dict[str, Any]]) -> str:
+    if not items:
+        return "t"
+    if "t_round" in items[0]:
+        return "t_round"
+    return "t"
+
+
+# ---------------------------------------------------------------------
+# Auditor
+# ---------------------------------------------------------------------
 class ResidualOIAuditor:
-    """Compute residual-OI violations on DR plug-in residuals.
-
-    Expected DR buffer item schema (GraphAwareDR.buffer entries):
-      - a: group id (protected attribute)
-      - p_hat: score/probability in [0,1]
-      - r0: DR plug-in residual for arm 0 (gamma_0 - p_hat)
-      - r_delta: DR plug-in residual for treatment effect ((gamma_1-gamma_0) - tau_x)
-      - x: (optional) dict of local structural features
-    """
+    """Residual-OI auditor used by scripts/run_copf.py."""
 
     def __init__(self, cfg: OIAuditConfig):
         self.cfg = cfg
-        self.rng = np.random.default_rng(int(cfg.seed))
+        self.rng = np.random.default_rng(cfg.seed)
 
-        # RFF parameters are lazily initialized because we need feature dimension.
+        # RFF parameters (initialized lazily once we know feature dimension)
         self._rff_W: Optional[np.ndarray] = None
         self._rff_b: Optional[np.ndarray] = None
-        self._rff_dim_in: Optional[int] = None
+        self._rff_in_dim: Optional[int] = None
 
-    # ------------------------------
-    # Public API
-    # ------------------------------
-    def audit(self, dr_buffer: Sequence[Dict[str, Any]], groups: Sequence[Any]) -> Dict[str, Any]:
-        """Audit both residuals on the current DR buffer."""
-        items = self._select_window(dr_buffer)
+    # -----------------
+    # Weighting helpers
+    # -----------------
+    def _ga_weights(self, items: Sequence[Dict[str, Any]]) -> Tuple[np.ndarray, float, float]:
+        """Return (w, sum_w, n_eff). Uses GA weights if configured & available."""
+        n = len(items)
+        if n == 0:
+            return np.zeros(0, dtype=float), 0.0, 0.0
 
-        out: Dict[str, Any] = {
-            "n": int(len(items)),
-        }
-        if not items:
-            return out
+        if not bool(self.cfg.use_ga_weights):
+            w = np.ones(n, dtype=float)
+            return w, float(w.sum()), float(n)
 
-        # Discrete auditors
-        disc0 = self._audit_discrete(items, residual_key="r0", groups=groups)
-        discd = self._audit_discrete(items, residual_key="r_delta", groups=groups)
+        w_local = np.array([float(it.get("w_local", 1.0)) for it in items], dtype=float)
+        w_local = np.where(np.isfinite(w_local), w_local, 0.0)
+        w_local = np.maximum(w_local, 0.0)
 
-        out.update({
-            "disc_r0": disc0,
-            "disc_r_delta": discd,
-        })
+        gamma = _get_gamma(items)
+        if gamma > 0.0:
+            t_key = _get_time_key(items)
+            t = np.array([float(it.get(t_key, 0.0)) for it in items], dtype=float)
+            t = np.where(np.isfinite(t), t, 0.0)
+            t_max = float(np.max(t)) if t.size > 0 else 0.0
+            dt = np.maximum(0.0, t_max - t)
+            w_time = np.exp(-gamma * dt)
+        else:
+            w_time = np.ones(n, dtype=float)
 
-        # Kernel auditors (optional)
-        if int(self.cfg.rff_dim) > 0:
-            out["rff_r0"] = self._audit_rff(items, residual_key="r0")
-            out["rff_r_delta"] = self._audit_rff(items, residual_key="r_delta")
+        w = w_local * w_time
+        w = np.where(np.isfinite(w), w, 0.0)
+        w = np.maximum(w, 0.0)
 
-        # Transfer-style certificates (Corollary 1 form)
-        #   gCal <= (eps0 + beta0)/pmin_slice
-        #   gTE  <= 2*(epsD + betaD)/pmin_group
-        # Here we compute eps from discrete auditors.
-        eps0 = float(disc0.get("eps_uncond", 0.0))
-        beta0 = float(disc0.get("beta", 0.0))
-        pmin_slice = float(disc0.get("pmin_group_bucket", 0.0))
-        out["bound_gCal_max"] = self._bound_one_over_pmin(eps0 + beta0, pmin_slice, factor=1.0)
+        sum_w = float(w.sum())
+        if sum_w <= 0.0:
+            # fall back to uniform if weights are degenerate
+            w = np.ones(n, dtype=float)
+            sum_w = float(w.sum())
 
-        epsD = float(discd.get("eps_uncond_group", 0.0))
-        betaD = float(discd.get("beta_group", 0.0))
-        pmin_g = float(discd.get("pmin_group", 0.0))
-        out["bound_gTE_gap"] = self._bound_one_over_pmin(epsD + betaD, pmin_g, factor=2.0)
+        n_eff = _effective_n(w)
+        if n_eff <= 0.0:
+            n_eff = float(n)
 
-        return out
+        return w, sum_w, float(n_eff)
 
-    # ------------------------------
-    # Discrete auditors
-    # ------------------------------
-    def _audit_discrete(self, items: Sequence[Dict[str, Any]], residual_key: str, groups: Sequence[Any]) -> Dict[str, Any]:
-        """Compute discrete residual-OI violations.
-
-        Returns both:
-          - eps_uncond: max_h |E[ h * r ]| over chosen auditors (unconditional)
-          - eps_cond:   max_h |E[ r | slice ]| over group×bucket slices (conditional)
-        and pmins needed for transfer bounds.
+    # -----------------------
+    # Group parsing
+    # -----------------------
+    def _parse_groups_arg(
+        self,
+        items: Sequence[Dict[str, Any]],
+        groups: Optional[Sequence[int]],
+        full_len: int,
+    ) -> Tuple[np.ndarray, Optional[List[int]]]:
         """
+        Returns:
+          - g_vec: per-item group vector (len == len(items))
+          - group_ids: optional list of allowed group IDs (or None)
 
-        N = int(len(items))
-        if N <= 0:
-            return {}
+        Supported `groups` inputs:
+          - None
+          - per-item vector (len == full_len or len == len(items))
+          - small list of group ids (e.g. [0,1])
+        """
+        n = len(items)
+        # default: read from items
+        g_vec = np.array([int(it.get("a", 0)) for it in items], dtype=int)
+        group_ids: Optional[List[int]] = None
 
-        # Build score buckets per group using p_hat distribution in the audited window.
-        edges_by_group: Dict[Any, List[Tuple[float, float]]] = {}
-        for g in groups:
-            g_scores = [
-                _safe_float(it.get("p_hat", 0.5), 0.5)
-                for it in items
-                if it.get("a", None) == g
-            ]
-            if len(g_scores) < 2:
-                continue
-            edges_by_group[g] = equal_mass_buckets(
-                np.asarray(g_scores, float),
-                int(self.cfg.buckets_per_group),
-                min_mass=float(self.cfg.min_mass),
-            )
+        if groups is None:
+            return g_vec, group_ids
 
-        # Optional structural bins (global, not per-group)
+        try:
+            g_list = [int(x) for x in list(groups)]
+        except Exception:
+            g_list = []
+        if len(g_list) == 0:
+            return g_vec, group_ids
+
+        # Case: per-item group labels for full buffer -> slice to window
+        if len(g_list) == full_len:
+            g_tail = g_list[-n:]
+            g_vec = np.array(g_tail, dtype=int)
+            return g_vec, group_ids
+
+        # Case: per-item labels already windowed
+        if len(g_list) == n:
+            g_vec = np.array(g_list, dtype=int)
+            return g_vec, group_ids
+
+        # Otherwise: treat as group-id list
+        group_ids = g_list
+        return g_vec, group_ids
+
+    # -----------------------
+    # Discrete (bucket) audit
+    # -----------------------
+    def _audit_discrete(
+        self,
+        items: Sequence[Dict[str, Any]],
+        *,
+        g_vec: np.ndarray,
+        group_ids: Optional[List[int]],
+        residual_key: str,
+        w: np.ndarray,
+        sum_w: float,
+        n_eff: float,
+    ) -> Dict[str, Any]:
+        cfg = self.cfg
+        n = len(items)
+        if n == 0 or sum_w <= 0.0:
+            return {
+                "eps_uncond": 0.0,
+                "eps_cond_group_bucket": 0.0,
+                "pmin_group_bucket": 0.0,
+                "eps_uncond_group": 0.0,
+                "eps_cond_group": 0.0,
+                "pmin_group": 0.0,
+                "beta": 0.0,
+                "beta_group": 0.0,
+                "top_violations": [],
+                "n_eff": float(n_eff),
+                "sum_w": float(sum_w),
+                "total_samples": 0,
+            }
+
+        scores = np.array([float(it.get("p_hat", 0.5)) for it in items], dtype=float)
+        r = np.array([float(it.get(residual_key, 0.0)) for it in items], dtype=float)
+
+        # Decide which groups to include
+        obs_groups = sorted(set(int(x) for x in g_vec.tolist()))
+        if group_ids is not None:
+            uniq_groups = [int(g) for g in group_ids if int(g) in obs_groups]
+            if not uniq_groups:
+                uniq_groups = obs_groups
+        else:
+            uniq_groups = obs_groups
+
+        n_groups = len(uniq_groups)
+
+        # Bucket intervals per group (equal-mass buckets on scores within each group)
+        n_b = max(1, int(cfg.buckets_per_group))
+        bucket_edges: Dict[int, List[Tuple[float, float]]] = {}
+        for g in uniq_groups:
+            mask = (g_vec == int(g))
+            vals = scores[mask].tolist()
+            if len(vals) >= 2:
+                edges = equal_mass_buckets(vals, n_b)  # list[(lo,hi)]
+                if len(edges) == 0:
+                    edges = [(float(min(vals)), float(max(vals)))]
+                bucket_edges[g] = [(float(lo), float(hi)) for (lo, hi) in edges]
+            elif len(vals) == 1:
+                v = float(vals[0])
+                bucket_edges[g] = [(v, v)]
+            else:
+                # group has no samples in window; skip by setting a dummy interval
+                bucket_edges[g] = [(0.0, 1.0)]
+
+        # Optional structural feature bins (global)
         struct_edges: Dict[str, List[Tuple[float, float]]] = {}
-        if bool(self.cfg.include_struct) and int(self.cfg.struct_bins) > 1:
-            for feat in self.cfg.struct_features:
+        if cfg.include_struct:
+            n_sb = max(1, int(cfg.struct_bins))
+            struct_feats = ["degree_u", "degree_v", "time_since_last"]
+            for feat in struct_feats:
                 vals = []
                 for it in items:
                     x = it.get("x", {}) or {}
-                    if feat not in x:
-                        continue
-                    v = _safe_float(x.get(feat, 0.0), 0.0)
-                    # log1p on heavy-tailed features
-                    if "degree" in feat or "cnt" in feat or "num" in feat:
-                        v = _log1p_nonneg(v)
-                    if "time" in feat:
-                        v = _log1p_nonneg(v)
-                    vals.append(v)
-                if len(vals) < 2:
-                    continue
-                struct_edges[feat] = equal_mass_buckets(
-                    np.asarray(vals, float),
-                    int(self.cfg.struct_bins),
-                    min_mass=float(self.cfg.min_mass),
-                )
+                    vals.append(float(x.get(feat, 0.0)))
+                if len(vals) >= 2:
+                    e = equal_mass_buckets(vals, n_sb)
+                    struct_edges[feat] = [(float(lo), float(hi)) for (lo, hi) in e]
+                elif len(vals) == 1:
+                    v = float(vals[0])
+                    struct_edges[feat] = [(v, v)]
+                else:
+                    struct_edges[feat] = [(0.0, 0.0)]
 
-        # Accumulators for auditors: key -> (sum_r, count)
-        sum_r: Dict[Tuple[Any, ...], float] = {}
-        cnt: Dict[Tuple[Any, ...], int] = {}
+        # GA-weighted sums
+        sum_w_slice: Dict[Tuple[Any, ...], float] = defaultdict(float)
+        sum_w_r_slice: Dict[Tuple[Any, ...], float] = defaultdict(float)
 
-        # Track pmins
-        cnt_group: Dict[Any, int] = {}
-        cnt_gb: Dict[Tuple[Any, int], int] = {}
+        gb_keys: List[Tuple[Any, ...]] = []
+        g_keys: List[Tuple[Any, ...]] = []
 
-        for it in items:
-            g = it.get("a", None)
-            if g is None:
+        for i, it in enumerate(items):
+            g = int(g_vec[i])
+            wi = float(w[i])
+            ri = float(r[i])
+
+            # Ignore groups outside allowed list (if provided)
+            if group_ids is not None and g not in uniq_groups:
                 continue
 
-            p = float(np.clip(_safe_float(it.get("p_hat", 0.5), 0.5), 1e-6, 1.0 - 1e-6))
-            r = _safe_float(it.get(residual_key, 0.0), 0.0)
+            if cfg.include_group_bucket:
+                # bucket within that group's bucket intervals
+                b = int(bucket_index(bucket_edges[g], float(scores[i])))
+                k_gb = ("gb", g, b)
+                if k_gb not in sum_w_slice:
+                    gb_keys.append(k_gb)
+                sum_w_slice[k_gb] += wi
+                sum_w_r_slice[k_gb] += wi * ri
 
-            # group count
-            cnt_group[g] = cnt_group.get(g, 0) + 1
-
-            # Group-only auditors: h = 1{A=g}
-            if bool(self.cfg.include_group_only):
-                k = ("g", g)
-                sum_r[k] = sum_r.get(k, 0.0) + r
-                cnt[k] = cnt.get(k, 0) + 1
-
-            # Group×bucket auditors: h = 1{A=g, p_hat in I_b}
-            if bool(self.cfg.include_group_bucket):
-                edges = edges_by_group.get(g)
-                if edges is None:
-                    continue
-                b = int(bucket_index(edges, p))
-                k = ("gb", g, b)
-                sum_r[k] = sum_r.get(k, 0.0) + r
-                cnt[k] = cnt.get(k, 0) + 1
-                cnt_gb[(g, b)] = cnt_gb.get((g, b), 0) + 1
-
-                # Optional structural auditors: h = 1{A=g, bucket=b, feat in bin}
-                if struct_edges:
+                if cfg.include_struct and struct_edges:
                     x = it.get("x", {}) or {}
-                    for feat, edges_f in struct_edges.items():
-                        v = _safe_float(x.get(feat, 0.0), 0.0)
-                        if "degree" in feat or "cnt" in feat or "num" in feat:
-                            v = _log1p_nonneg(v)
-                        if "time" in feat:
-                            v = _log1p_nonneg(v)
-                        sb = int(bucket_index(edges_f, float(v)))
-                        kf = ("gbf", g, b, feat, sb)
-                        sum_r[kf] = sum_r.get(kf, 0.0) + r
-                        cnt[kf] = cnt.get(kf, 0) + 1
+                    for feat, edges in struct_edges.items():
+                        xv = float(x.get(feat, 0.0))
+                        sb = int(bucket_index(edges, xv))
+                        k = ("gbS", g, b, feat, sb)
+                        sum_w_slice[k] += wi
+                        sum_w_r_slice[k] += wi * ri
 
-        # Compute epsilons
-        # Unconditional means: E[h*r] ~ sum_r / N
+            if cfg.include_group_only:
+                k_g = ("g", g)
+                if k_g not in sum_w_slice:
+                    g_keys.append(k_g)
+                sum_w_slice[k_g] += wi
+                sum_w_r_slice[k_g] += wi * ri
+
+        keys_all = list(sum_w_slice.keys())
+
+        # -----------------------------------------------------------------
+        # Slice masses under GA weights
+        # -----------------------------------------------------------------
+        def _mass(k: Tuple[Any, ...]) -> float:
+            sw = float(sum_w_slice.get(k, 0.0))
+            if sw <= 0.0 or sum_w <= 0.0:
+                return 0.0
+            return sw / float(sum_w)
+
+        # Helper: whether a slice should participate in eps/pmin (min-mass filter)
+        min_mass = float(getattr(cfg, "min_mass", 0.0) or 0.0)
+
+        def _keep(k: Tuple[Any, ...]) -> bool:
+            if min_mass <= 0.0:
+                return True
+            return _mass(k) >= min_mass
+
+        # -----------------------------------------------------------------
+        # ε values
+        # -----------------------------------------------------------------
+        # Unconditional: max_k |E_w[ 1{k} r ]|.
+        # IMPORTANT: apply the same min-mass filter to avoid "pmin" being
+        # dominated by vanishing-mass slices that we otherwise ignore.
         eps_uncond = 0.0
-        top = []
-        for k, sr in sum_r.items():
-            mu_uncond = float(sr) / float(N)
-            abs_mu = abs(mu_uncond)
-            if abs_mu > eps_uncond:
-                eps_uncond = abs_mu
-            top.append((abs_mu, k, mu_uncond, cnt.get(k, 0)))
-
-        top.sort(key=lambda x: x[0], reverse=True)
-        top = top[: int(max(0, self.cfg.budget_B))]
-
-        # Conditional means on group×bucket slices: E[r | slice]
-        eps_cond_gb = 0.0
-        for (g, b), c in cnt_gb.items():
-            if c <= 0:
+        for k in keys_all:
+            if not _keep(k):
                 continue
-            sr = sum_r.get(("gb", g, b), 0.0)
-            mu_cond = float(sr) / float(c)
-            eps_cond_gb = max(eps_cond_gb, abs(mu_cond))
+            mu_uncond = sum_w_r_slice[k] / sum_w
+            eps_uncond = max(eps_uncond, abs(mu_uncond))
 
-        # pmins
-        pmin_g = 0.0
-        if cnt_group:
-            pmin_g = min(cnt_group.values()) / float(N)
+        eps_cond_gb = 0.0
+        for k in gb_keys:
+            if not _keep(k):
+                continue
+            denom = sum_w_slice[k]
+            if denom > 0:
+                eps_cond_gb = max(eps_cond_gb, abs(sum_w_r_slice[k] / denom))
 
+        eps_uncond_g = 0.0
+        eps_cond_g = 0.0
+        for k in g_keys:
+            if not _keep(k):
+                continue
+            mu_uncond = sum_w_r_slice[k] / sum_w
+            eps_uncond_g = max(eps_uncond_g, abs(mu_uncond))
+            denom = sum_w_slice[k]
+            if denom > 0:
+                eps_cond_g = max(eps_cond_g, abs(sum_w_r_slice[k] / denom))
+
+        # -----------------------------------------------------------------
+        # p_min values
+        # -----------------------------------------------------------------
+        # p_min must be consistent with the min-mass filter used for ε.
+        # Otherwise bound = (ε+β)/p_min can explode even when the tiny-mass
+        # slices are excluded from ε (this was the root cause of the boundCal
+        # blow-ups you observed).
         pmin_gb = 0.0
-        if cnt_gb:
-            pmin_gb = min(cnt_gb.values()) / float(N)
+        if gb_keys:
+            masses = [_mass(k) for k in gb_keys if _keep(k) and sum_w_slice[k] > 0.0]
+            pmin_gb = float(min(masses)) if masses else 0.0
 
-        # Confidence radius proxy beta ~ sqrt(log|H|/N)
-        H_eff = max(2, len(sum_r))
-        beta = float(np.sqrt(np.log(float(H_eff)) / float(max(1, N))))
+        pmin_g = 0.0
+        if g_keys:
+            masses = [_mass(k) for k in g_keys if _keep(k) and sum_w_slice[k] > 0.0]
+            pmin_g = float(min(masses)) if masses else 0.0
 
-        # Also compute group-only epsilon (needed for gTE bound)
-        eps_uncond_group = 0.0
-        if bool(self.cfg.include_group_only):
-            for g in cnt_group.keys():
-                sr = sum_r.get(("g", g), 0.0)
-                eps_uncond_group = max(eps_uncond_group, abs(float(sr) / float(N)))
+        # NOTE: eps_uncond already applies min-mass filter above.
 
-        beta_group = float(np.sqrt(np.log(float(max(2, len(cnt_group)))) / float(max(1, N))))
+        H = max(1, len(keys_all))
+        beta = math.sqrt(max(0.0, math.log((H + 1.0) / max(1e-12, cfg.delta))) / max(1.0, n_eff))
 
-        return {
-            "residual": residual_key,
-            "N": N,
-            "H_eff": int(H_eff),
-            "beta": beta,
-            "beta_group": beta_group,
+        H_g = max(1, n_groups)
+        beta_g = math.sqrt(max(0.0, math.log((H_g + 1.0) / max(1e-12, cfg.delta))) / max(1.0, n_eff))
 
-            "eps_uncond": float(eps_uncond),
-            "eps_uncond_group": float(eps_uncond_group),
-            "eps_cond_group_bucket": float(eps_cond_gb),
-
-            "pmin_group": float(pmin_g),
-            "pmin_group_bucket": float(pmin_gb),
-
-            "top_violations": [
+        # Top violations for debugging
+        viols = []
+        for k in keys_all:
+            if not _keep(k):
+                continue
+            mass = _mass(k)
+            mu_uncond = sum_w_r_slice[k] / sum_w
+            denom = sum_w_slice[k]
+            mu_cond = (sum_w_r_slice[k] / denom) if denom > 0 else 0.0
+            viols.append(
                 {
-                    "abs_Ehr": float(a),
-                    "key": tuple(k),
-                    "Ehr": float(mu),
-                    "count": int(c),
+                    "slice": k,
+                    "mass": float(mass),
+                    "mu_uncond": float(mu_uncond),
+                    "mu_cond": float(mu_cond),
                 }
-                for (a, k, mu, c) in top
-            ],
-        }
-
-    # ------------------------------
-    # Any-kernel auditors via RFF
-    # ------------------------------
-    def _audit_rff(self, items: Sequence[Dict[str, Any]], residual_key: str) -> Dict[str, Any]:
-        """Approximate RKHS residual-OI via Random Fourier Features.
-
-        We compute the RKHS norm of the residual-weighted mean embedding:
-            eps ≈ || (1/N) Σ r_i φ(x_i) ||_2
-        where φ are RFF features for an RBF kernel.
-        """
-        N = int(len(items))
-        if N <= 0:
-            return {}
-
-        X = self._rff_design_matrix(items)  # [N,d]
-        r = np.asarray([_safe_float(it.get(residual_key, 0.0), 0.0) for it in items], float)
-        Phi = self._rff_features(X)  # [N,M]
-
-        m = (r.reshape(-1, 1) * Phi).mean(axis=0)
-        eps = float(np.linalg.norm(m, ord=2))
-
-        # A crude confidence proxy. (Optional; mainly for logging.)
-        beta = float(np.sqrt(float(Phi.shape[1]) / float(max(1, N))))
+            )
+        viols.sort(key=lambda d: abs(d.get("mu_uncond", 0.0)), reverse=True)
+        topB = max(1, int(cfg.budget_B))
+        viols = viols[:topB]
 
         return {
-            "residual": residual_key,
-            "N": N,
-            "M": int(Phi.shape[1]),
-            "eps_rkhs": eps,
-            "beta": beta,
+            "eps_uncond": float(eps_uncond),
+            "eps_cond_group_bucket": float(eps_cond_gb),
+            "pmin_group_bucket": float(pmin_gb),
+            "eps_uncond_group": float(eps_uncond_g),
+            "eps_cond_group": float(eps_cond_g),
+            "pmin_group": float(pmin_g),
+            "beta": float(beta),
+            "beta_group": float(beta_g),
+            "top_violations": viols,
+            "n_eff": float(n_eff),
+            "sum_w": float(sum_w),
+            "total_samples": int(n),
         }
 
-    def _rff_design_matrix(self, items: Sequence[Dict[str, Any]]) -> np.ndarray:
-        """Build a continuous feature vector per item for RFF.
+    # -----------------------
+    # Any-kernel (RFF) auditor
+    # -----------------------
+    def _rff_init(self, in_dim: int) -> None:
+        if self._rff_W is not None and self._rff_b is not None and self._rff_in_dim == int(in_dim):
+            return
+        self._rff_in_dim = int(in_dim)
 
-        We intentionally keep it simple and robust:
-          x = [group_id, p_hat, log1p(degree_u), log1p(degree_v), log1p(time_since_last)]
-        Missing structural features are treated as 0.
-        """
-        rows = []
-        for it in items:
-            g = _safe_float(it.get("a", 0.0), 0.0)
-            p = float(np.clip(_safe_float(it.get("p_hat", 0.5), 0.5), 1e-6, 1.0 - 1e-6))
-            x = it.get("x", {}) or {}
-            du = _log1p_nonneg(_safe_float(x.get("degree_u", 0.0), 0.0))
-            dv = _log1p_nonneg(_safe_float(x.get("degree_v", 0.0), 0.0))
-            tsl = _log1p_nonneg(_safe_float(x.get("time_since_last", 0.0), 0.0))
-            rows.append([g, p, du, dv, tsl])
-        X = np.asarray(rows, float)
+        D = int(self.cfg.rff_dim)
+        gamma = float(self.cfg.rff_gamma)
+        gamma = max(1e-12, gamma)
 
-        # Standardize to mean 0, std 1 for stable gamma
-        mu = X.mean(axis=0)
-        sd = X.std(axis=0)
-        sd = np.where(sd <= 1e-8, 1.0, sd)
-        X = (X - mu) / sd
+        # For RBF kernel: k(x,y)=exp(-gamma ||x-y||^2),
+        # sample w ~ N(0, 2*gamma I)
+        self._rff_W = self.rng.normal(loc=0.0, scale=math.sqrt(2.0 * gamma), size=(in_dim, D))
+        self._rff_b = self.rng.uniform(low=0.0, high=2.0 * math.pi, size=(D,))
+
+    def _rff_features(self, items: Sequence[Dict[str, Any]]) -> np.ndarray:
+        # Keep features compact & stable
+        p_hat = np.array([float(it.get("p_hat", 0.5)) for it in items], dtype=float)
+        tau_x = np.array([float(it.get("tau_x", 1.0)) for it in items], dtype=float)
+
+        feats = [p_hat[:, None], tau_x[:, None]]
+
+        if self.cfg.include_struct:
+            struct_feats = ["degree_u", "degree_v", "time_since_last"]
+            for feat in struct_feats:
+                col = []
+                for it in items:
+                    x = it.get("x", {}) or {}
+                    col.append(float(x.get(feat, 0.0)))
+                feats.append(np.array(col, dtype=float)[:, None])
+
+        X = np.concatenate(feats, axis=1)
+        X = np.where(np.isfinite(X), X, 0.0)
         return X
 
-    def _init_rff(self, d: int) -> None:
-        M = int(self.cfg.rff_dim)
-        gamma = float(max(1e-12, self.cfg.rff_gamma))
+    def _audit_rkhs(self, X: np.ndarray, r: np.ndarray, *, w: np.ndarray, sum_w: float, n_eff: float) -> Dict[str, Any]:
+        if X.size == 0 or len(r) == 0:
+            return {"eps": 0.0, "beta": 0.0, "n_eff": float(n_eff)}
 
-        # For RBF kernel k(x,y) = exp(-gamma ||x-y||^2)
-        # RFF uses w ~ N(0, 2*gamma I)
-        self._rff_W = self.rng.normal(loc=0.0, scale=np.sqrt(2.0 * gamma), size=(M, d))
-        self._rff_b = self.rng.uniform(low=0.0, high=2.0 * np.pi, size=(M,))
-        self._rff_dim_in = int(d)
+        self._rff_init(in_dim=int(X.shape[1]))
+        assert self._rff_W is not None and self._rff_b is not None
 
-    def _rff_features(self, X: np.ndarray) -> np.ndarray:
-        assert X.ndim == 2
-        N, d = X.shape
-        M = int(self.cfg.rff_dim)
-        if self._rff_W is None or self._rff_b is None or self._rff_dim_in != int(d):
-            self._init_rff(d)
+        Phi = math.sqrt(2.0 / float(self.cfg.rff_dim)) * np.cos(X @ self._rff_W + self._rff_b[None, :])
+        wr = (w * r).astype(float)
+        m = (wr[:, None] * Phi).sum(axis=0) / float(sum_w)
 
-        W = self._rff_W  # [M,d]
-        b = self._rff_b  # [M]
-        Z = X @ W.T + b.reshape(1, -1)
-        Phi = np.sqrt(2.0 / float(M)) * np.cos(Z)
-        return Phi
+        eps = float(np.linalg.norm(m, ord=2))
 
-    # ------------------------------
-    # Helpers
-    # ------------------------------
-    def _select_window(self, dr_buffer: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not dr_buffer:
-            return []
-        w = int(self.cfg.window)
-        if w <= 0 or w >= len(dr_buffer):
-            return list(dr_buffer)
-        return list(dr_buffer[-w:])
+        beta = math.sqrt(float(self.cfg.rff_dim) / max(1.0, n_eff)) * math.sqrt(
+            max(0.0, math.log(2.0 / max(1e-12, self.cfg.delta)))
+        )
+        return {"eps": eps, "beta": float(beta), "n_eff": float(n_eff)}
 
-    @staticmethod
-    def _bound_one_over_pmin(x: float, pmin: float, factor: float = 1.0) -> float:
-        pmin = float(max(1e-9, pmin))
-        return float(factor * float(x) / pmin)
+    # -----
+    # Public
+    # -----
+    def audit(self, dr_buffer: Sequence[Dict[str, Any]], *, groups: Optional[Sequence[int]] = None) -> Dict[str, Any]:
+        full_len = len(dr_buffer)
+
+        # Apply window
+        if self.cfg.window and self.cfg.window > 0:
+            items = list(dr_buffer[-int(self.cfg.window) :])
+        else:
+            items = list(dr_buffer)
+
+        g_vec, group_ids = self._parse_groups_arg(items, groups, full_len=full_len)
+
+        w, sum_w, n_eff = self._ga_weights(items)
+
+        disc_r0 = self._audit_discrete(
+            items,
+            g_vec=g_vec,
+            group_ids=group_ids,
+            residual_key="r0",
+            w=w,
+            sum_w=sum_w,
+            n_eff=n_eff,
+        )
+        disc_r_delta = self._audit_discrete(
+            items,
+            g_vec=g_vec,
+            group_ids=group_ids,
+            residual_key="r_delta",
+            w=w,
+            sum_w=sum_w,
+            n_eff=n_eff,
+        )
+
+        # Bounds (match scripts/run_copf.py expectations)
+        # If p_min is effectively 0 after filtering, the certificate is undefined.
+        pmin_gb_raw = float(disc_r0.get("pmin_group_bucket", 0.0))
+        pmin_g_raw = float(disc_r_delta.get("pmin_group", 0.0))
+
+        if not np.isfinite(pmin_gb_raw) or pmin_gb_raw <= 0.0:
+            bound_gCal_max = float("nan")
+        else:
+            bound_gCal_max = (
+                float(disc_r0.get("eps_uncond", 0.0)) + float(disc_r0.get("beta", 0.0))
+            ) / max(1e-12, pmin_gb_raw)
+
+        if not np.isfinite(pmin_g_raw) or pmin_g_raw <= 0.0:
+            bound_gTE_gap = float("nan")
+        else:
+            bound_gTE_gap = 2.0 * (
+                float(disc_r_delta.get("eps_uncond_group", 0.0)) + float(disc_r_delta.get("beta_group", 0.0))
+            ) / max(1e-12, pmin_g_raw)
+
+        out: Dict[str, Any] = {
+            "disc_r0": disc_r0,
+            "disc_r_delta": disc_r_delta,
+            "bound_gCal_max": float(bound_gCal_max),
+            "bound_gTE_gap": float(bound_gTE_gap),
+        }
+
+        # Optional RKHS auditing
+        if self.cfg.rff_dim and self.cfg.rff_dim > 0:
+            X = self._rff_features(items)
+            r0 = np.array([float(it.get("r0", 0.0)) for it in items], dtype=float)
+            rd = np.array([float(it.get("r_delta", 0.0)) for it in items], dtype=float)
+            out["kernel_r0"] = self._audit_rkhs(X, r0, w=w, sum_w=sum_w, n_eff=n_eff)
+            out["kernel_r_delta"] = self._audit_rkhs(X, rd, w=w, sum_w=sum_w, n_eff=n_eff)
+
+        return out
+
+
+# Backward-compatible alias (some earlier patches used this name)
+OIAnyKernelAuditor = ResidualOIAuditor
