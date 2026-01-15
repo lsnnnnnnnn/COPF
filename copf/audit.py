@@ -28,6 +28,10 @@ class AuditorConfig:
     step: float = 0.25
     min_mass: float = 0.02
 
+    # Safety: cap logit-offset magnitude to avoid numerical blow-ups when
+    # using aggressive steps (e.g., λCal-scaled updates).
+    offset_clip: float = 5.0
+
 
 class ActiveAuditorSet:
     """Maintains active set H^act of most violated auditors"""
@@ -114,6 +118,7 @@ class MultiCalibrator:
         dr,
         prefer_arm: int = 0,
         dr_clip: float = 0.02,
+        step_scale: float = 1.0,
     ) -> None:
         """
         Update calibration using counterfactual residuals.
@@ -168,8 +173,12 @@ class MultiCalibrator:
             key = (g, bidx)
             self.counts[key] = int(self.counts.get(key, 0) + len(residuals))
 
-            lr = float(self.cfg.step / np.sqrt(max(1, self.counts[key])))
-            self.offsets[key] = float(self.offsets.get(key, 0.0) + lr * avg_r)
+            base_step = float(self.cfg.step) * float(max(0.0, step_scale))
+            lr = float(base_step / np.sqrt(max(1, self.counts[key])))
+            new_off = float(self.offsets.get(key, 0.0) + lr * avg_r)
+            if float(self.cfg.offset_clip) > 0:
+                new_off = float(np.clip(new_off, -float(self.cfg.offset_clip), float(self.cfg.offset_clip)))
+            self.offsets[key] = float(new_off)
 
         if violations:
             self.active_set.update(violations)
@@ -242,7 +251,13 @@ class MultiCalibrator:
             m[key] = it
         return m
 
-    def update_from_dr(self, dr, max_items: int = 5000, dr_clip: float = 0.02) -> None:
+    def update_from_dr(
+        self,
+        dr,
+        max_items: int = 5000,
+        dr_clip: float = 0.02,
+        step_scale: float = 1.0,
+    ) -> None:
         """
         Alternative update route: update buckets + offsets directly from DR buffer residuals.
         Useful when you want calibrator driven purely by DR history rather than per-step cands.
@@ -251,7 +266,10 @@ class MultiCalibrator:
         if not buf:
             return
 
-        items = buf[-max_items:] if max_items is not None else list(buf)
+        # NOTE: dr.buffer is a collections.deque in our GA-DR implementation.
+        # deque supports integer indexing but NOT slicing. Convert to list first.
+        seq = list(buf)
+        items = seq[-max_items:] if max_items is not None else seq
         if not items:
             return
 
@@ -292,8 +310,12 @@ class MultiCalibrator:
             violations[key] = avg_r
 
             self.counts[key] = int(self.counts.get(key, 0) + len(rs))
-            lr = float(self.cfg.step / np.sqrt(max(1, self.counts[key])))
-            self.offsets[key] = float(self.offsets.get(key, 0.0) + lr * avg_r)
+            base_step = float(self.cfg.step) * float(max(0.0, step_scale))
+            lr = float(base_step / np.sqrt(max(1, self.counts[key])))
+            new_off = float(self.offsets.get(key, 0.0) + lr * avg_r)
+            if float(self.cfg.offset_clip) > 0:
+                new_off = float(np.clip(new_off, -float(self.cfg.offset_clip), float(self.cfg.offset_clip)))
+            self.offsets[key] = float(new_off)
 
         if violations:
             self.active_set.update(violations)

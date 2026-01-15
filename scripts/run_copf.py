@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import importlib.util
 import inspect
 import types
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -59,8 +60,14 @@ from copf.eval import (
 )
 from copf.fairness import gCal, gTE, gMin, gRisk
 
+# Coverage-driven exploration (Step 2)
+from copf.coverage import CoverageExplorerConfig, CoverageDrivenExplorer
+
 # Residual-OI auditing utilities (new file: copf/oi_audit.py)
 from copf.oi_audit import OIAuditConfig, ResidualOIAuditor
+
+# Primal-dual coordination (Step 3)
+from copf.primal_dual import PIDualConfig, PIDualController
 
 
 # ---------------------------------------------------------------------
@@ -684,6 +691,76 @@ def main() -> None:
     ap.add_argument("--epsilon", type=float, default=0.1)
     ap.add_argument("--temperature", type=float, default=1.0)
 
+    # ---------------- Step 2: coverage-driven exploration ----------------
+    ap.add_argument(
+        "--covexp_enable",
+        action="store_true",
+        help=(
+            "Enable coverage-driven exploration: increase epsilon and restrict the exploration pool "
+            "to under-covered (group, score-bucket) slices."
+        ),
+    )
+    ap.add_argument(
+        "--covexp_ptar",
+        type=float,
+        default=0.02,
+        help=(
+            "Target minimum exposure share per (group,bucket) slice used by coverage-driven exploration. "
+            "(Default: 0.02)"
+        ),
+    )
+    ap.add_argument(
+        "--covexp_c",
+        type=float,
+        default=1.0,
+        help="Scaling coefficient in eps_boost = c * max(0, ptar - share(slice)). (Default: 1.0)",
+    )
+    ap.add_argument(
+        "--covexp_eps_min",
+        type=float,
+        default=0.0,
+        help="Minimum epsilon floor when coverage-driven exploration is active. (Default: 0.0)",
+    )
+    ap.add_argument(
+        "--covexp_eps_max",
+        type=float,
+        default=0.5,
+        help="Maximum epsilon cap when coverage-driven exploration is active. (Default: 0.5)",
+    )
+    ap.add_argument(
+        "--covexp_ema_rounds",
+        type=int,
+        default=200,
+        help="EMA horizon (in rounds) for exposure-share tracking. (Default: 200)",
+    )
+    ap.add_argument(
+        "--covexp_warmup_rounds",
+        type=int,
+        default=50,
+        help="Warmup rounds before enabling coverage-driven exploration. (Default: 50)",
+    )
+    ap.add_argument(
+        "--covexp_score_window",
+        type=int,
+        default=40000,
+        help="How many recent scores per group to store to recompute equal-mass buckets. (Default: 40000)",
+    )
+    ap.add_argument(
+        "--covexp_update_buckets_every",
+        type=int,
+        default=200,
+        help="How often (in rounds) to recompute equal-mass buckets for coverage slices. (Default: 200)",
+    )
+    ap.add_argument(
+        "--covexp_buckets_per_group",
+        type=int,
+        default=-1,
+        help=(
+            "Number of score buckets per group used for coverage slices. "
+            "If <0, falls back to --aud_buckets_per_group."
+        ),
+    )
+
     # OPP phases (Section 13): pre → deploy → post
     ap.add_argument("--pre_T", type=int, default=0, help="If >0, use pre/deploy/post protocol")
     ap.add_argument("--deploy_T", type=int, default=0)
@@ -713,6 +790,13 @@ def main() -> None:
     ap.add_argument("--dr_no_sn", action="store_true")
     ap.add_argument("--dr_no_ratio_stab", action="store_true")
 
+    # τ(x) target for r(Δ):
+    #  - 'global' (recommended for TE-parity certificates; τ cancels in group differences)
+    #  - 'plugin'  (τ(x)=μ̂1-μ̂0, x-dependent)
+    ap.add_argument("--tau_mode", type=str, default="global", choices=["global", "plugin"])
+    ap.add_argument("--tau_ema_alpha", type=float, default=0.02, help="EMA rate for global τ target (0 keeps it constant)")
+    ap.add_argument("--tau_init", type=float, default=0.0, help="Initial global τ target")
+
     # cross-fit
     ap.add_argument("--cf_folds", type=int, default=5)
     ap.add_argument("--cf_max_buffer", type=int, default=20000)
@@ -735,6 +819,36 @@ def main() -> None:
 
     # gMin threshold (if <0, we set it from pre phase 10th percentile of tau)
     ap.add_argument("--tau_min", type=float, default=-1.0)
+
+    # ============================================================
+    # Step 3: primal-dual (PI controller) + hierarchical priorities
+    # ============================================================
+    ap.add_argument("--pd_enable", action="store_true", help="Enable PI primal-dual updates (policy bias).")
+    ap.add_argument("--pd_gamma_p", type=float, default=0.2)
+    ap.add_argument("--pd_gamma_i", type=float, default=0.02)
+    ap.add_argument("--pd_lambda_max", type=float, default=50.0)
+
+    # ramp schedule targets ρ_t,k (0 disables ramping)
+    ap.add_argument("--pd_ramp_start", type=int, default=0)
+    ap.add_argument("--pd_ramp_end", type=int, default=0)
+
+    # final targets
+    ap.add_argument("--pd_te_target", type=float, default=0.05)
+    ap.add_argument("--pd_cal_target", type=float, default=0.05)
+
+    # optional start targets (set <0 to use final target)
+    ap.add_argument("--pd_te_target_start", type=float, default=-1.0)
+    ap.add_argument("--pd_cal_target_start", type=float, default=-1.0)
+
+    # stability heuristics (paper Section 15.5)
+    ap.add_argument("--pd_no_soften_by_beta", action="store_true", help="Disable g/(1+beta) softening")
+    ap.add_argument("--pd_no_hierarchical", action="store_true", help="Disable TE-first gating for cal dual updates")
+    ap.add_argument("--pd_te_margin", type=float, default=0.0)
+
+    # policy effect: logit shift bounds
+    ap.add_argument("--pd_offset_scale", type=float, default=1.0)
+    ap.add_argument("--pd_logit_clip", type=float, default=2.0)
+    ap.add_argument("--pd_apply_phases", type=str, default="deploy,post", help="Comma-separated phases to apply TE bias: pre,deploy,post,all")
 
     args = ap.parse_args()
     _ensure_dir(args.out_dir)
@@ -772,6 +886,28 @@ def main() -> None:
             n_groups=int(args.tgb_group_n),
             warmup=int(args.tgb_group_warmup),
         )
+
+    # ============================================================
+    # Step 2: coverage-driven exploration (optional)
+    # ============================================================
+    cov_cfg = CoverageExplorerConfig(
+        enabled=bool(getattr(args, "covexp_enable", False)),
+        buckets_per_group=int(
+            args.covexp_buckets_per_group
+            if int(getattr(args, "covexp_buckets_per_group", -1)) > 0
+            else int(args.aud_buckets_per_group)
+        ),
+        score_window=int(getattr(args, "covexp_score_window", 40000)),
+        update_buckets_every=int(getattr(args, "covexp_update_buckets_every", 200)),
+        bucket_min_mass=float(getattr(args, "aud_min_mass", 0.02)),
+        ema_window_rounds=int(getattr(args, "covexp_ema_rounds", 200)),
+        warmup_rounds=int(getattr(args, "covexp_warmup_rounds", 50)),
+        ptar=float(getattr(args, "covexp_ptar", 0.02)),
+        c=float(getattr(args, "covexp_c", 1.0)),
+        eps_min=float(getattr(args, "covexp_eps_min", 0.0)),
+        eps_max=float(getattr(args, "covexp_eps_max", 0.5)),
+    )
+    cov_explorer = CoverageDrivenExplorer(cov_cfg, groups_list)
 
     T_total = min(int(args.T), len(edges))
 
@@ -935,6 +1071,9 @@ def main() -> None:
         ratio_stab=(not args.dr_no_ratio_stab),
         winsor_eps=float(args.dr_winsor_eps),
         min_eff_samples=int(args.dr_min_eff),
+        tau_mode=str(args.tau_mode),
+        tau_ema_alpha=float(args.tau_ema_alpha),
+        tau_init=float(args.tau_init),
     )
 
     # NOTE: use positional arg to avoid signature mismatches (cfg vs config)
@@ -968,6 +1107,37 @@ def main() -> None:
         window=int(args.oi_window),
     )
     oi_auditor = ResidualOIAuditor(cfg=oi_cfg)
+
+    # ============================================================
+    # Step 3: PI primal-dual controller (optional)
+    # ============================================================
+    pd_cfg = PIDualConfig(
+        enabled=bool(getattr(args, "pd_enable", False)),
+        gamma_p=float(getattr(args, "pd_gamma_p", 0.2)),
+        gamma_i=float(getattr(args, "pd_gamma_i", 0.02)),
+        ramp_start=int(getattr(args, "pd_ramp_start", 0)),
+        ramp_end=int(getattr(args, "pd_ramp_end", 0)),
+        te_target=float(getattr(args, "pd_te_target", 0.05)),
+        cal_target=float(getattr(args, "pd_cal_target", 0.05)),
+        te_target_start=(None if float(getattr(args, "pd_te_target_start", -1.0)) < 0 else float(getattr(args, "pd_te_target_start"))),
+        cal_target_start=(None if float(getattr(args, "pd_cal_target_start", -1.0)) < 0 else float(getattr(args, "pd_cal_target_start"))),
+        soften_by_beta=(not bool(getattr(args, "pd_no_soften_by_beta", False))),
+        hierarchical=(not bool(getattr(args, "pd_no_hierarchical", False))),
+        te_margin=float(getattr(args, "pd_te_margin", 0.0)),
+        lambda_max=float(getattr(args, "pd_lambda_max", 50.0)),
+        offset_scale=float(getattr(args, "pd_offset_scale", 1.0)),
+        logit_clip=float(getattr(args, "pd_logit_clip", 2.0)),
+    )
+    pd_controller = PIDualController(pd_cfg, groups_list)
+
+    # phases where we apply the TE-bias policy shift
+    _pd_phases_raw = str(getattr(args, "pd_apply_phases", "deploy,post"))
+    if _pd_phases_raw.strip().lower() == "all":
+        pd_apply_phases = {"pre", "deploy", "post"}
+    else:
+        pd_apply_phases = {p.strip().lower() for p in _pd_phases_raw.split(',') if p.strip()}
+        pd_apply_phases = {p for p in pd_apply_phases if p in {"pre", "deploy", "post"}}
+
 
     # ============================================================
     # Simple online structural stats for x (features for nuisance models / kernel auditing)
@@ -1024,23 +1194,53 @@ def main() -> None:
             "n": int(util_n),
         }
 
-        # fairness
-        gte_gap = float(gTE(dr_phase, groups_list))
+        # Align fairness metrics (gTE/gCal/gMin/gRisk) and certificates (Residual-OI)
+        # on the *same* audit window and with the *same* GA weights.
+        buf_items = list(dr_phase.buffer)
+        oi_win = int(getattr(args, "oi_window", 0) or 0)
+        if oi_win > 0:
+            audit_items = buf_items[-min(len(buf_items), oi_win):]
+        else:
+            audit_items = buf_items
 
-        te_by_group = dr_phase.estimate_TE_by_group(group_key="a")
-        tau_by_group = {
-            str(g): {"tau": float(v), "n_eff": int(n)} for g, (v, n) in te_by_group.items()
-        }
+        # A windowed DR "view" so gTE/gMin/gRisk are computed on the same window as OI.
+        dr_audit = GraphAwareDR(dr_cfg, cross_fitter=None)
+        dr_audit.buffer = deque(audit_items, maxlen=max(1, len(audit_items)))
+        try:
+            dr_audit.tau_global = float(getattr(dr_phase, "tau_global", 0.0))
+            dr_audit._tau_valid = True
+        except Exception:
+            pass
+
+        # fairness (priority: gTE)
+        gte_gap = float(gTE(dr_audit, groups_list))
+
+        te_by_group = dr_audit.estimate_TE_by_group(group_key="a")
+        tau_by_group = {str(g): {"tau": float(v), "n_eff": int(n)} for g, (v, n) in te_by_group.items()}
         tau_vals = [float(v) for (v, n) in te_by_group.values() if n > 0]
         tau_avg = float(np.mean(np.asarray(tau_vals, float))) if tau_vals else 0.0
         tau_min_obs = float(np.min(np.asarray(tau_vals, float))) if tau_vals else 0.0
-        gcal_dict = gCal(
-            batch=list(dr_phase.buffer),
-            dr=dr_phase,
+
+        # gCal on *all* buckets (diagnostic) and on p_min-kept buckets (certificate-aligned).
+        gcal_dict_all = gCal(
+            batch=audit_items,
+            dr=dr_audit,
             groups=groups_list,
             buckets_per_group=int(args.aud_buckets_per_group),
             isotonic=bool(args.aud_isotonic),
             min_mass=float(args.aud_min_mass),
+            ga_mass_filter=False,
+        )
+        gcal_max_all = float(max(gcal_dict_all.values())) if gcal_dict_all else 0.0
+
+        gcal_dict = gCal(
+            batch=audit_items,
+            dr=dr_audit,
+            groups=groups_list,
+            buckets_per_group=int(args.aud_buckets_per_group),
+            isotonic=bool(args.aud_isotonic),
+            min_mass=float(args.aud_min_mass),
+            ga_mass_filter=True,
         )
         gcal_max = float(max(gcal_dict.values())) if gcal_dict else 0.0
 
@@ -1050,19 +1250,20 @@ def main() -> None:
                 tau_min_value = float(args.tau_min)
             else:
                 # 10th percentile of per-group tau (paper protocol)
-                te = dr_phase.estimate_TE_by_group(group_key="a")
+                te = dr_audit.estimate_TE_by_group(group_key="a")
                 vals = [float(v) for (v, n) in te.values() if n > 0]
                 tau_min_value = float(np.percentile(np.asarray(vals, float), 10)) if vals else 0.0
 
-        gmin = float(gMin(dr_phase, tau_min=float(tau_min_value or 0.0)))
-        grisk = float(gRisk(dr_phase, groups_list))
+        gmin = float(gMin(dr_audit, tau_min=float(tau_min_value or 0.0)))
+        grisk = float(gRisk(dr_audit, groups_list))
 
         # residual-OI + transfer certificate
-        oi = oi_auditor.audit(dr_phase.buffer, groups=groups_list)
+        oi = oi_auditor.audit(audit_items, groups=groups_list)
 
         fairness = {
             "gTE_gap": gte_gap,
             "gCal_max": gcal_max,
+            "gCal_max_all": gcal_max_all,
             "gMin": gmin,
             "gRisk": grisk,
             "tau_avg": tau_avg,
@@ -1077,6 +1278,10 @@ def main() -> None:
         gcal_path = os.path.join(args.out_dir, f"{phase_name}_gcal_detail.json")
         with open(gcal_path, "w") as f:
             json.dump({str(k): float(v) for k, v in gcal_dict.items()}, f, indent=2)
+
+        gcal_path_all = os.path.join(args.out_dir, f"{phase_name}_gcal_detail_all.json")
+        with open(gcal_path_all, "w") as f:
+            json.dump({str(k): float(v) for k, v in gcal_dict_all.items()}, f, indent=2)
 
         # reset accumulators
         util_sum = {"mrr": 0.0, "ap": 0.0, "hits": 0.0, "ndcg": 0.0, "deploy_hit": 0.0}
@@ -1128,21 +1333,41 @@ def main() -> None:
                 }
             )
 
+        # Step 3: primal-dual policy bias (TE-parity) BEFORE calibration/decision
+        pd_apply_diag = {"pd_shift_abs_mean": 0.0, "pd_shift_abs_max": 0.0, "pd_shift_nonzero": 0.0}
+        if bool(pd_cfg.enabled) and (phase in pd_apply_phases):
+            tau_by_group = dr_phase.estimate_TE_by_group(group_key="a")
+            pd_offsets = pd_controller.group_logit_offsets(tau_by_group)
+            pd_apply_diag = pd_controller.apply_te_bias_to_candidates(cands, pd_offsets, store_debug=True)
+        else:
+            pd_offsets = {}
+
         # apply r0-calibrator offsets BEFORE decision
         if phase != "pre" or bool(args.pre_apply_calibrator):
             calibrator.apply(cands)
 
         # decision + propensities
         topk, eps, temp = _policy_params(phase)
+
+        # Step 2: coverage-driven exploration
+        eps_eff, explore_mask, cov_diag = cov_explorer.plan(
+            cands,
+            base_epsilon=float(eps),
+            topk=int(topk),
+        )
         d_list, e_list = decide_with_exploration(
             cands=cands,
             policy=str(args.policy),
             topk=int(topk),
-            epsilon=float(eps),
+            epsilon=float(eps_eff),
             temperature=float(temp),
+            explore_mask=explore_mask,
             rng=rng,
         )
         log_propensities(cands, d_list, e_list)
+
+        # Update coverage tracker with realized exposures
+        cov_explorer.update(cands, d_list)
 
         # ---------------------------------------------------------------------
         # Observed outcomes used by the OPP / DR estimator.
@@ -1212,21 +1437,65 @@ def main() -> None:
 
         # log row every log_every
         if (i + 1) % int(args.log_every) == 0:
+            # Align fairness metrics (gTE/gCal) and OI certificates on the *same* audit window.
+            buf_items = list(dr_phase.buffer)
+            oi_win = int(getattr(args, "oi_window", 0) or 0)
+            if oi_win > 0:
+                audit_items = buf_items[-min(len(buf_items), oi_win):]
+            else:
+                audit_items = buf_items
+
+            # Windowed DR view for gTE (so the deterministic inequality with the
+            # OI certificate holds using identical weights/window).
+            dr_audit = GraphAwareDR(dr_cfg, cross_fitter=None)
+            dr_audit.buffer = deque(audit_items, maxlen=max(1, len(audit_items)))
+            try:
+                dr_audit.tau_global = float(getattr(dr_phase, "tau_global", 0.0))
+                dr_audit._tau_valid = True
+            except Exception:
+                pass
+
             # fairness (priority: gTE)
-            gte_gap = float(gTE(dr_phase, groups_list))
-            gcal_dict = gCal(
-                batch=list(dr_phase.buffer[-min(len(dr_phase.buffer), 20000):]),
-                dr=dr_phase,
+            gte_gap = float(gTE(dr_audit, groups_list))
+
+            gcal_dict_all = gCal(
+                batch=audit_items,
+                dr=dr_audit,
                 groups=groups_list,
                 buckets_per_group=int(args.aud_buckets_per_group),
                 isotonic=bool(args.aud_isotonic),
                 min_mass=float(args.aud_min_mass),
+                ga_mass_filter=False,
+            )
+            gcal_max_all = float(max(gcal_dict_all.values())) if gcal_dict_all else 0.0
+
+            gcal_dict = gCal(
+                batch=audit_items,
+                dr=dr_audit,
+                groups=groups_list,
+                buckets_per_group=int(args.aud_buckets_per_group),
+                isotonic=bool(args.aud_isotonic),
+                min_mass=float(args.aud_min_mass),
+                ga_mass_filter=True,
             )
             gcal_max = float(max(gcal_dict.values())) if gcal_dict else 0.0
 
-            oi = oi_auditor.audit(dr_phase.buffer, groups=groups_list)
+            oi = oi_auditor.audit(audit_items, groups=groups_list)
 
             aud_diag = calibrator.get_diagnostics()
+
+
+            # Step 3: PI primal-dual update (uses current fairness estimates)
+            beta_te_pd = float(oi.get("disc_r_delta", {}).get("beta_group", 0.0))
+            beta_cal_pd = float(oi.get("disc_r0", {}).get("beta", 0.0))
+            pd_update_diag = pd_controller.update(
+                step=int(i + 1),
+                total_T=int(T),
+                gte_gap=float(gte_gap),
+                gcal_max=float(gcal_max),
+                beta_te=float(beta_te_pd),
+                beta_cal=float(beta_cal_pd),
+            )
 
             row: Dict[str, Any] = {
                 "step": i + 1,
@@ -1240,6 +1509,7 @@ def main() -> None:
                 # fairness + certificates
                 "gTE_gap": gte_gap,
                 "gCal_max": gcal_max,
+                "gCal_max_all": gcal_max_all,
                 "bound_gTE_gap": float(oi.get("bound_gTE_gap", float("nan"))),
                 "bound_gCal_max": float(oi.get("bound_gCal_max", float("nan"))),
 
@@ -1259,7 +1529,70 @@ def main() -> None:
                 "audit_n_active": aud_diag.get("n_active", 0),
                 "audit_beta_t": aud_diag.get("beta_t", np.nan),
                 "audit_total_samples": aud_diag.get("total_samples", 0),
+
+                # Step 2: coverage-driven exploration diagnostics (per-round)
+                "cov_enabled": float(cov_diag.get("cov_enabled", 0.0)) if isinstance(cov_diag, dict) else 0.0,
+                "cov_eps": float(cov_diag.get("cov_eps", np.nan)) if isinstance(cov_diag, dict) else np.nan,
+                "cov_pool_frac": float(cov_diag.get("cov_pool_frac", np.nan)) if isinstance(cov_diag, dict) else np.nan,
+                "cov_min_share_present": float(cov_diag.get("cov_min_share_present", np.nan)) if isinstance(cov_diag, dict) else np.nan,
+                "cov_max_deficit_present": float(cov_diag.get("cov_max_deficit_present", np.nan)) if isinstance(cov_diag, dict) else np.nan,
             }
+
+            # Step 3: primal-dual diagnostics (policy + λ targets)
+            row.update({
+                "pd_enabled": float(pd_update_diag.get("pd_enabled", 0.0)),
+                "lambda_te": float(pd_update_diag.get("lambda_te", 0.0)),
+                "lambda_cal": float(pd_update_diag.get("lambda_cal", 0.0)),
+                "rho_te": float(pd_update_diag.get("rho_te", float("nan"))),
+                "rho_cal": float(pd_update_diag.get("rho_cal", float("nan"))),
+                "pd_cal_gate_open": float(pd_update_diag.get("cal_gate_open", 0.0)),
+                "pd_gte_soft": float(pd_update_diag.get("gte_soft", float("nan"))),
+                "pd_gcal_soft": float(pd_update_diag.get("gcal_soft", float("nan"))),
+                "pd_v_te": float(pd_update_diag.get("v_te", float("nan"))),
+                "pd_v_cal": float(pd_update_diag.get("v_cal", float("nan"))),
+
+                # per-round applied policy shift stats
+                "pd_shift_abs_mean": float(pd_apply_diag.get("pd_shift_abs_mean", float("nan"))),
+                "pd_shift_abs_max": float(pd_apply_diag.get("pd_shift_abs_max", float("nan"))),
+                "pd_shift_nonzero": float(pd_apply_diag.get("pd_shift_nonzero", float("nan"))),
+            })
+
+
+            # Sanity check (Scheme A): bound_gCal_max should upper-bound gCal_max when both are
+            # evaluated on the same audit window (audit_items).
+            try:
+                _bound_cal = float(oi.get("bound_gCal_max", float("nan")))
+            except Exception:
+                _bound_cal = float("nan")
+            if np.isfinite(_bound_cal) and (float(gcal_max) > _bound_cal + 1e-6):
+                top = sorted(gcal_dict.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                try:
+                    top_fmt = [(str(k), float(v)) for k, v in top]
+                except Exception:
+                    top_fmt = []
+                print(
+                    f"[WARN] gCal_max({float(gcal_max):.4f}) > boundCal({float(_bound_cal):.4f}) "
+                    f"at step {i+1} phase={phase}. Top gCal slices: {top_fmt[:3]}"
+                )
+
+
+            # Sanity check: bound_gTE_gap should upper-bound gTE_gap when τ(x) is group-invariant
+            # (e.g., tau_mode='global'). If you see persistent violations here, it indicates either
+            # τ(x) is x-dependent, pmin is too small, or DR/plugin error is dominating.
+            try:
+                _bound_te = float(oi.get("bound_gTE_gap", float("nan")))
+            except Exception:
+                _bound_te = float("nan")
+            if np.isfinite(_bound_te) and (float(gte_gap) > _bound_te + 1e-6):
+                try:
+                    te_by_group_dbg = dr_phase.estimate_TE_by_group(group_key="a")
+                    te_top = sorted([(str(k), float(v[0])) for k, v in te_by_group_dbg.items()], key=lambda kv: kv[0])
+                except Exception:
+                    te_top = []
+                print(
+                    f"[WARN] gTE_gap({float(gte_gap):.4f}) > boundTE({float(_bound_te):.4f}) "
+                    f"at step {i+1} phase={phase}. TE_by_group: {te_top}"
+                )
 
             if hasattr(model, "diagnostics"):
                 try:
@@ -1273,10 +1606,28 @@ def main() -> None:
             if "last_loss" in row:
                 extra = f"loss={row.get('last_loss', np.nan):.4f} "
 
+            # Step 3: primal-dual (λ) log
+            if float(row.get("pd_enabled", 0.0)) > 0.5:
+                extra += (
+                    f"lambdaTE={row.get('lambda_te', 0.0):.4f} "
+                    f"lambdaCal={row.get('lambda_cal', 0.0):.4f} "
+                    f"rhoTE={row.get('rho_te', np.nan):.4f} "
+                    f"rhoCal={row.get('rho_cal', np.nan):.4f} "
+                    f"gateCal={int(row.get('pd_cal_gate_open', 0.0))} "
+                    f"pd_shift={row.get('pd_shift_abs_mean', np.nan):.3f} "
+                )
+
+            if float(row.get("cov_enabled", 0.0)) > 0.5:
+                extra += (
+                    f"cov_eps={row.get('cov_eps', np.nan):.4f} "
+                    f"cov_pool={row.get('cov_pool_frac', np.nan):.2f} "
+                    f"cov_def={row.get('cov_max_deficit_present', np.nan):.4f} "
+                )
+
             print(
                 f"[OPP-COPF {i+1}/{T} {phase}] "
                 f"mrr={row['mrr']:.4f} ap={row['ap']:.4f} hits@{args.hits_k}={row[f'hits@{args.hits_k}']:.4f} "
-                f"gTE={row['gTE_gap']:.4f} gCal_max={row['gCal_max']:.4f} "
+                f"gTE={row['gTE_gap']:.4f} gCal_max={row['gCal_max']:.4f} gCal_all={row.get('gCal_max_all', np.nan):.4f} "
                 f"boundTE={row['bound_gTE_gap']:.4f} boundCal={row['bound_gCal_max']:.4f} "
                 f"n_active={row['audit_n_active']} beta={row['audit_beta_t']:.4f} "
                 f"{extra}"
@@ -1310,6 +1661,9 @@ def main() -> None:
                 "audit_every": args.audit_every,
                 "dr_cfg": asdict(dr_cfg),
                 "aud_cfg": asdict(aud_cfg),
+                "covexp_cfg": asdict(cov_cfg),
+                "pd_cfg": asdict(pd_cfg),
+                "pd_apply_phases": sorted(list(pd_apply_phases)),
                 "crossfit": (not args.no_crossfit),
                 "cf_folds": args.cf_folds,
             },

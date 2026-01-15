@@ -1,367 +1,350 @@
+"""fairlink/copf/dr.py
+
+Graph-aware doubly robust (GA-DR) estimation utilities for COPF.
+
+This module maintains an online buffer of candidate dyads and provides
+self-normalized GA-weighted DR plug-in estimates needed for:
+  - within-group counterfactual calibration (gCal)
+  - treatment-effect parity (gTE)
+  - residual-OI auditing certificates (bounds)
+
+Paper-alignment notes
+---------------------
+The paper defines counterfactual residuals (Section 6):
+  r(0) = Y(0) - p̂
+  r(Δ) = (Y(1) - Y(0)) - τ(x)
+
+In our implementation:
+  - We estimate Y(a) with the DR score Γ̃(a) (Definition 1 in the paper).
+  - Therefore we use r0_hat := Γ̃(0) - p̂ and r_delta_hat := (Γ̃(1)-Γ̃(0)) - τ(x).
+
+IMPORTANT (TE-parity certificate fix; "method 1")
+-------------------------------------------------
+To make the residual-OI certificate for TE-parity match Lemma 2,
+τ(x) must *not* vary across groups in a way that would survive the
+(s1,s2) difference.
+
+This file supports two modes for τ(x):
+  - tau_mode='plugin': τ(x) = μ̂1(x) - μ̂0(x) (x-dependent).
+  - tau_mode='global': τ(x) = τ_global (a global constant / EMA over time).
+
+For TE-parity certificates, prefer tau_mode='global'.
 """
-Graph-Aware Doubly Robust Estimation (GA-DR)
-Implements Definition 1 and Section 5 from the paper
-"""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Dict, Any, Callable, Tuple, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+from collections import deque
 import numpy as np
 
-def winsorize01(x: np.ndarray, eps: float = 0.02) -> np.ndarray:
-    """Winsorize to [eps, 1-eps] for stability"""
-    lo, hi = eps, 1.0 - eps
-    return np.clip(x, lo, hi)
 
-def ratio_stabilize(r: np.ndarray) -> np.ndarray:
-    """Stabilize ratios to prevent explosion"""
-    return r / (1.0 + np.abs(r))
+def winsorize01(p: float, eps: float) -> float:
+    """Clip probability to [eps, 1-eps]."""
+    p = float(p)
+    if not np.isfinite(p):
+        return 0.5
+    eps = float(max(0.0, min(0.49, eps)))
+    return float(min(1.0 - eps, max(eps, p)))
+
+
+def ratio_stabilize(p: float, clip: float) -> float:
+    """A tiny stabilizer for propensities to avoid 1/p blowing up."""
+    p = winsorize01(p, clip)
+    # shrink towards 0.5 slightly
+    return float(0.98 * p + 0.01)
+
 
 @dataclass
 class DRConfig:
-    clip: float = 0.05  # emin for propensity clipping
-    self_normalized: bool = True  # Self-normalized DR (Definition 1)
-    decay_gamma: float = 0.1  # Locality weight decay γ
+    clip: float = 0.05
+    self_normalized: bool = True
+    decay_gamma: float = 0.1
     max_buffer: int = 200000
     ratio_stab: bool = True
     winsor_eps: float = 0.02
     min_eff_samples: int = 100
 
-def ga_dr_score_arm(y: np.ndarray, d: np.ndarray, e: np.ndarray, mu: np.ndarray,
-                    clip: float = 0.05, do_ratio_stab: bool = True) -> np.ndarray:
-    """Compute GA-DR score for one arm"""
-    e = np.clip(e, clip, 1.0 - clip)
-    res = y - mu
-    if do_ratio_stab:
-        res = ratio_stabilize(res)
-    return mu + (d / e) * res
+    # --- TE target τ(x) options ---
+    tau_mode: str = "global"  # ['global', 'plugin']
+    tau_ema_alpha: float = 0.02
+    tau_init: float = 0.0
 
-def ga_dr_aggregate(slice_mask: np.ndarray, gamma: np.ndarray, weight: np.ndarray = None,
-                    winsor_eps: float = 0.02) -> float:
-    """Aggregate GA-DR scores with weights"""
-    m = slice_mask.astype(bool)
-    if weight is None:
-        weight = np.ones_like(gamma)
-    num = np.sum(weight[m] * gamma[m])
-    den = np.sum(weight[m]) + 1e-12
-    est = num / den
-    return float(winsorize01(np.array([est]), eps=winsor_eps)[0])
 
 class GraphAwareDR:
-    """
-    Graph-Aware Doubly Robust estimator with locality weights
-    Implements Definition 1 from the paper
-    """
-    
-    def __init__(self, config: DRConfig, 
-                 cross_fitter=None,
-                 neighborhood_tracker=None):
-        self.cfg = config
-        self.buffer: List[Dict[str, Any]] = []
-        self.cross_fitter = cross_fitter
-        self.neighborhood_tracker = neighborhood_tracker
-        self.t = 0
-    
-    def _clip_propensity(self, e: float) -> float:
-        """Clip propensity to ensure overlap (Assumption 1)"""
-        eps = float(self.cfg.clip)
-        return float(max(eps, min(1.0 - eps, e)))
-    
-    def ingest(self, cands: List[Dict[str, Any]]):
-        """
-        Process candidates and compute DR components with cross-fitting
-        Implements OPP-4 update step
-        """
-        for c in cands:
-            # Extract base score
-            p = float(c.get('p_hat', 0.5))
-            
-            # Get logged propensity
-            e_logged = float(c.get('e_hat', 0.5))
-            
-            # Treatment and outcome
-            d = int(c.get('d', 0))
-            y_obs = float(c.get('y', 0))
-            
-            # Protected attribute and time
-            a = c.get('a', None)
-            t_step = c.get('t', self.t)
-            
-            # Get cross-fitted predictions if available
-            if self.cross_fitter is not None:
-                # Use cross-fitted estimates directly (no blending)
-                mu0 = self.cross_fitter.predict_outcome(c, arm=0, t=t_step)
-                mu1 = self.cross_fitter.predict_outcome(c, arm=1, t=t_step)
-                e1 = self.cross_fitter.predict_propensity(c, t=t_step)
-            else:
-                # Fallback to simple estimates
-                e1 = e_logged
-                mu0 = float(c.get('mu0_hat', p))
-                mu1 = float(c.get('mu1_hat', p * 1.2))
-            
-            # Clip propensity for stability
-            e1 = self._clip_propensity(e1)
-            e0 = 1.0 - e1
-            
-            # Compute locality weight w_t(i,j) = exp(-γ * NeighborhoodChangeRate)
-            if self.neighborhood_tracker is not None and hasattr(c, '__getitem__'):
-                if 'u' in c and 'v' in c:
-                    w_local = self.neighborhood_tracker.compute_locality_weight(
-                        int(c['u']), int(c['v']), int(t_step)
-                    )
-                else:
-                    w_local = 1.0
-            else:
-                w_local = float(c.get('locality_weight', 1.0))
-            
-            # Compute GA-DR scores (Definition 1)
-            # Γ^(a)_t(i,j) = μ̂_a + (1{D=a}/ê^(a)) * (Y - μ̂_a)
-            
-            # For Y^(0)
-            if d == 0:
-                # Observed control
-                gamma_0 = mu0 + (1.0 / e0) * (y_obs - mu0)
-                if self.cfg.ratio_stab:
-                    gamma_0 = mu0 + ratio_stabilize((y_obs - mu0) / e0)
-            else:
-                # Unobserved control
-                gamma_0 = mu0
-            
-            # For Y^(1)
-            if d == 1:
-                # Observed treatment
-                gamma_1 = mu1 + (1.0 / e1) * (y_obs - mu1)
-                if self.cfg.ratio_stab:
-                    gamma_1 = mu1 + ratio_stabilize((y_obs - mu1) / e1)
-            else:
-                # Unobserved treatment
-                gamma_1 = mu1
-            
-            # Compute counterfactual residuals for auditor (Section 6)
-            # r^(0) = Y^(0) - p̂
-            r0 = gamma_0 - p
-            
-            # r^(Δ) = (Y^(1) - Y^(0)) - τ(x)
-            tau_x = mu1 - mu0  # Plug-in estimate of τ(x)
-            r_delta = (gamma_1 - gamma_0) - tau_x
-            
-            # Store complete record
-            item = {
-                # Identifiers
-                'u': c.get('u'), 'v': c.get('v'),
-                't': t_step, 'a': a,
-                
-                # Scores and propensities
-                'p_hat': p, 'e_hat': e_logged, 'e_cf': e1,
-                
-                # Treatment and outcome
-                'd': d, 'y': y_obs, 'y_dr': y_obs,
-                
-                # Cross-fitted nuisance estimates
-                'mu0_hat': mu0, 'mu1_hat': mu1,
-                
-                # GA-DR scores
-                'gamma_0': gamma_0, 'gamma_1': gamma_1,
-                
-                # Locality weight (Definition 1)
-                'w_local': w_local,
-                # Time-decay gamma for GA weights (used by OI auditing to match GA-DR weighting)
-                'ga_gamma': float(self.cfg.decay_gamma),
+    """Graph-aware DR plug-in estimator with an online buffer."""
 
-                
-                # Counterfactual residuals (Section 6)
-                'r0': r0, 'r_delta': r_delta, 'tau_x': tau_x
-            }
-            
-            self.buffer.append(item)
-        
-        # Maintain buffer size
-        if len(self.buffer) > self.cfg.max_buffer:
-            self.buffer = self.buffer[-self.cfg.max_buffer:]
-        
-        self.t += 1
-    
-    def _weights(self, items: List[Dict[str, Any]]) -> np.ndarray:
-        """
-        Compute combined weights: locality * time_decay
-        Implements w_t from Definition 1
-        """
-        n = len(items)
-        if n == 0:
-            return np.zeros(0, dtype=float)
-        
-        # Locality weights from neighborhood change
-        w_local = np.array([float(i.get('w_local', 1.0)) for i in items])
-        
-        # Time decay weights (optional)
-        if self.cfg.decay_gamma > 0:
+    def __init__(self, config: DRConfig, cross_fitter: Optional[Any] = None):
+        self.cfg = config
+        self.cross_fitter = cross_fitter
+
+        self.buffer = deque(maxlen=int(config.max_buffer))
+
+        # global τ target (used when tau_mode='global')
+        self.tau_global: float = float(config.tau_init)
+        self._tau_valid: bool = True  # even tau_init=0.0 is a valid constant
+        self.last_tau_batch: float = float("nan")
+
+    # -----------------
+    # GA-weight helpers
+    # -----------------
+    def _weights(self, cond_mask: np.ndarray) -> Tuple[np.ndarray, float, float]:
+        items = list(self.buffer)
+        if len(items) == 0:
+            return np.zeros(0, dtype=float), 0.0, 0.0
+
+        w_local = np.array([float(it.get("w_local", 1.0)) for it in items], dtype=float)
+        w_local = np.where(np.isfinite(w_local), w_local, 0.0)
+        w_local = np.maximum(w_local, 0.0)
+
+        gamma = float(getattr(self.cfg, "decay_gamma", 0.0) or 0.0)
+        if gamma > 0.0:
+            t = np.array([float(it.get("t_round", it.get("t", 0.0))) for it in items], dtype=float)
+            t = np.where(np.isfinite(t), t, 0.0)
+            t_max = float(np.max(t)) if t.size > 0 else 0.0
+            dt = np.maximum(0.0, t_max - t)
+            w_time = np.exp(-gamma * dt)
+        else:
+            w_time = np.ones(len(items), dtype=float)
+
+        w = w_local * w_time
+        w = np.where(np.isfinite(w), w, 0.0)
+        w = np.maximum(w, 0.0)
+
+        if cond_mask is not None:
+            w = w * cond_mask.astype(float)
+
+        sum_w = float(w.sum())
+        if sum_w <= 0.0:
+            return w, 0.0, 0.0
+
+        # Kish effective sample size
+        s2 = float(np.sum(w * w))
+        n_eff = (sum_w * sum_w) / s2 if s2 > 0.0 else float(len(items))
+        return w, sum_w, float(n_eff)
+
+    # -----------------
+    # Nuisance update
+    # -----------------
+    def update_nuisance(self, c: Dict[str, Any]) -> Tuple[float, float]:
+        """Return (mu0, mu1) for candidate dict c."""
+        if self.cross_fitter is None:
+            # default fallback (do NOT use in real experiments)
+            p = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
+            return float(p), float(p)
+
+        # ------------------------------
+        # Cross-fitter API compatibility
+        # ------------------------------
+        # Different versions of the repo expose nuisance predictions under
+        # different method names. Prefer predict_mu() if available; otherwise
+        # fall back to predict_outcome()/get_predictions_batch().
+        t = c.get("t_round", c.get("t", None))
+        try:
+            t_int = int(t) if t is not None else None
+        except Exception:
+            t_int = None
+
+        if hasattr(self.cross_fitter, "predict_mu"):
+            mu0, mu1 = self.cross_fitter.predict_mu(c, t=t_int)
+            return float(mu0), float(mu1)
+
+        if hasattr(self.cross_fitter, "predict_outcome"):
+            mu0 = self.cross_fitter.predict_outcome(c, arm=0, t=t_int)
+            mu1 = self.cross_fitter.predict_outcome(c, arm=1, t=t_int)
+            return float(mu0), float(mu1)
+
+        if hasattr(self.cross_fitter, "get_predictions_batch"):
+            preds = self.cross_fitter.get_predictions_batch([c], t=t_int)
+            mu0 = float(np.asarray(preds.get("mu_0"))[0])
+            mu1 = float(np.asarray(preds.get("mu_1"))[0])
+            return float(mu0), float(mu1)
+
+        # Last-resort fallback
+        p = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
+        return float(p), float(p)
+
+    # -----------------
+    # Online ingest
+    # -----------------
+    def ingest(self, batch: Sequence[Dict[str, Any]]) -> None:
+        """Ingest a single round's candidate set into the DR buffer."""
+        if not batch:
+            return
+
+        tau_mode = str(getattr(self.cfg, "tau_mode", "global") or "global").strip().lower()
+        if tau_mode not in {"global", "plugin"}:
+            tau_mode = "global"
+
+        # For tau_mode='global', τ(x) is a constant at this round.
+        tau_for_resid = float(self.tau_global) if self._tau_valid else float(self.cfg.tau_init)
+
+        # Track a batch-level TE estimate to update τ_global (EMA) if enabled
+        batch_w_sum = 0.0
+        batch_te_num = 0.0
+
+        for c in batch:
+            # Required fields
+            a = int(c.get("a", 0))
+            p_hat = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
+
+            d = int(c.get("d", 0))
+            e_hat = float(c.get("e_hat", 0.5))
+            y = float(c.get("y", 0.0))
+
+            w_local = float(c.get("w_local", 1.0))
+            if not np.isfinite(w_local) or w_local < 0.0:
+                w_local = 0.0
+
+            t_round = c.get("t_round", c.get("t", 0))
             try:
-                t_max = max(int(i.get('t', 0)) for i in items)
-            except (ValueError, TypeError):
-                t_max = 0
-            
-            w_time = np.array([
-                np.exp(-self.cfg.decay_gamma * max(0, t_max - int(i.get('t', 0))))
-                for i in items
-            ])
-        else:
-            w_time = np.ones(n)
-        
-        return w_local * w_time
-    
-    def estimate_EY(self, cond: Callable[[Dict[str, Any]], bool], 
-                    arm: int) -> Tuple[float, int]:
-        """
-        Estimate E[Y^(arm) | condition] using GA-DR
-        Implements self-normalized estimator from Definition 1
-        """
-        # Filter buffer by condition
-        S = [c for c in self.buffer if cond(c)]
-        n = len(S)
-        
-        if n < self.cfg.min_eff_samples:
-            return 0.0, 0
-        
-        # Get weights
-        w = self._weights(S)
-        
-        # Get GA-DR scores
-        if arm == 0:
-            gamma = np.array([c['gamma_0'] for c in S])
-        else:
-            gamma = np.array([c['gamma_1'] for c in S])
-        
-        # Self-normalized estimator (Definition 1)
-        if self.cfg.self_normalized:
-            numerator = np.sum(w * gamma)
-            denominator = np.sum(w)
-            if denominator > 0:
-                est = numerator / denominator
+                t_round = int(t_round)
+            except Exception:
+                t_round = 0
+
+            # Nuisance predictions
+            mu0, mu1 = self.update_nuisance(c)
+            mu0 = float(mu0); mu1 = float(mu1)
+            if not np.isfinite(mu0):
+                mu0 = p_hat
+            if not np.isfinite(mu1):
+                mu1 = p_hat
+
+            # Propensity clipping
+            clip = float(self.cfg.clip)
+            e1 = winsorize01(e_hat, clip)
+            e0 = winsorize01(1.0 - e_hat, clip)
+            if bool(self.cfg.ratio_stab):
+                e1 = ratio_stabilize(e1, clip)
+                e0 = ratio_stabilize(e0, clip)
+
+            # DR scores
+            ind1 = 1.0 if d == 1 else 0.0
+            ind0 = 1.0 if d == 0 else 0.0
+            gamma1 = mu1 - (ind1 / e1) * (mu1 - y)
+            gamma0 = mu0 - (ind0 / e0) * (mu0 - y)
+
+            # τ(x) target
+            if tau_mode == "global":
+                tau_x = tau_for_resid
             else:
-                est = 0.0
+                # x-dependent plug-in target
+                tau_x = float(mu1 - mu0)
+
+            # counterfactual residuals (DR plug-ins)
+            r0 = float(gamma0 - p_hat)
+            r_delta = float((gamma1 - gamma0) - tau_x)
+
+            item = {
+                "a": a,
+                "p_hat": p_hat,
+                "d": d,
+                "e_hat": float(e_hat),
+                "y": y,
+                "mu0": mu0,
+                "mu1": mu1,
+                "gamma0": float(gamma0),
+                "gamma1": float(gamma1),
+                "r0": r0,
+                "r_delta": r_delta,
+                "tau_x": float(tau_x),
+                "w_local": w_local,
+                # Provide GA time-decay gamma explicitly so that external
+                # auditors (ResidualOIAuditor) can use the *same* GA weights
+                # as GraphAwareDR when computing certificates.
+                "ga_gamma": float(getattr(self.cfg, "decay_gamma", 0.0) or 0.0),
+                "decay_gamma": float(getattr(self.cfg, "decay_gamma", 0.0) or 0.0),
+                "t_round": t_round,
+                "t": float(c.get("t", t_round)),
+                "x": c.get("x", {}),
+            }
+            self.buffer.append(item)
+
+            # batch TE estimate for τ_global update
+            batch_w_sum += w_local
+            batch_te_num += w_local * float(gamma1 - gamma0)
+
+        # Update τ_global (EMA over rounds) if tau_mode='global'
+        if tau_mode == "global" and batch_w_sum > 0.0 and np.isfinite(batch_te_num):
+            tau_batch = float(batch_te_num / batch_w_sum)
+            self.last_tau_batch = tau_batch
+
+            alpha = float(getattr(self.cfg, "tau_ema_alpha", 0.0) or 0.0)
+            alpha = float(max(0.0, min(1.0, alpha)))
+            if alpha <= 0.0:
+                # constant τ_global
+                pass
+            else:
+                # EMA update
+                self.tau_global = float((1.0 - alpha) * float(self.tau_global) + alpha * tau_batch)
+                self._tau_valid = True
+
+    # -----------------
+    # Plug-in estimates
+    # -----------------
+    def estimate_EY(self, arm: int, cond: Optional[Tuple[str, int]] = None) -> Tuple[float, float]:
+        """Estimate E[Y(arm) | cond] with GA weights.
+
+        Returns (estimate, n_eff).
+
+        cond options:
+          - None
+          - ("a", group_id) condition on protected group
+        """
+        items = list(self.buffer)
+        if len(items) == 0:
+            return 0.0, 0.0
+
+        if cond is None:
+            cond_mask = np.ones(len(items), dtype=float)
         else:
-            # Simple weighted average
-            est = np.mean(gamma)
-        
-        # Winsorize for stability
-        est = float(winsorize01(np.array([est]), eps=self.cfg.winsor_eps)[0])
-        
-        return est, n
-    
-    def estimate_Y0(self, c: Dict[str, Any]) -> float:
-        """Estimate Y^(0) for a single candidate (used by auditor)"""
-        return float(c.get('gamma_0', c.get('mu0_hat', 0.5)))
-    
-    def estimate_Y1(self, c: Dict[str, Any]) -> float:
-        """Estimate Y^(1) for a single candidate"""
-        return float(c.get('gamma_1', c.get('mu1_hat', 0.5)))
-    
-    def estimate_TE_by_group(self, group_key: str = "a") -> Dict[Any, Tuple[float, int]]:
-        """
-        Estimate treatment effects τ_s = E[Y^(1) - Y^(0) | A=s]
-        Used for gTE and gMin computation
-        """
-        # Get unique groups
-        groups = sorted(list({c.get(group_key) for c in self.buffer}))
-        
-        results = {}
-        for s in groups:
-            # Define condition for group s
-            def cond_s(c, s=s):
-                return c.get(group_key) == s
-            
-            # Estimate E[Y^(1) | A=s] and E[Y^(0) | A=s]
-            ey1, n1 = self.estimate_EY(cond_s, arm=1)
-            ey0, n0 = self.estimate_EY(cond_s, arm=0)
-            
-            # Treatment effect
-            te = float(ey1 - ey0)
-            
-            # Clip to reasonable range
-            te = float(np.clip(te, -0.5, 0.5))
-            
-            # Effective sample size
-            n_eff = min(n1, n0)
-            
-            results[s] = (te, n_eff)
-        
-        return results
-    
-    def estimate_slice(self, slice_items: List[Dict[str, Any]], 
-                      arm: int, use_stabilization: bool = True) -> Tuple[float, int]:
-        """
-        Estimate E[Y^(arm)] for a specific slice
-        Used for gCal computation
-        """
-        n = len(slice_items)
-        if n < 10:  # Need minimum samples
-            return 0.0, 0
-        
-        # Get weights
-        w = self._weights(slice_items)
-        
-        # Get GA-DR scores
-        if arm == 0:
-            gamma = np.array([c.get('gamma_0', c.get('mu0_hat', 0.5)) for c in slice_items])
+            key, val = cond
+            if key == "a":
+                cond_mask = np.array([1.0 if int(it.get("a", 0)) == int(val) else 0.0 for it in items], dtype=float)
+            else:
+                cond_mask = np.ones(len(items), dtype=float)
+
+        w, sum_w, n_eff = self._weights(cond_mask)
+        if sum_w <= 0.0 or n_eff < float(self.cfg.min_eff_samples):
+            return 0.0, float(n_eff)
+
+        if int(arm) == 1:
+            g = np.array([float(it.get("gamma1", 0.0)) for it in items], dtype=float)
         else:
-            gamma = np.array([c.get('gamma_1', c.get('mu1_hat', 0.5)) for c in slice_items])
-        
-        # Self-normalized estimate
-        if self.cfg.self_normalized and w.sum() > 0:
-            est = np.sum(w * gamma) / np.sum(w)
-        else:
-            est = np.mean(gamma)
-        
-        # Winsorize
-        est = float(winsorize01(np.array([est]), eps=self.cfg.winsor_eps)[0])
-        
-        return est, n
-    
-    def get_residuals(self, group: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get counterfactual residuals for auditor
-        Returns r^(0) and r^(Δ) for residual OI
-        """
-        if group is not None:
-            items = [c for c in self.buffer if c.get('a') == group]
-        else:
-            items = self.buffer
-        
+            g = np.array([float(it.get("gamma0", 0.0)) for it in items], dtype=float)
+
+        g = np.where(np.isfinite(g), g, 0.0)
+        est = float(np.sum(w * g) / sum_w) if bool(self.cfg.self_normalized) else float(np.mean(g))
+        return est, float(n_eff)
+
+    def estimate_TE_by_group(self, group_key: str = "a") -> Dict[int, Tuple[float, float]]:
+        """Return {group: (TE_hat, n_eff)} using GA-DR plug-ins."""
+        items = list(self.buffer)
         if not items:
-            return np.array([]), np.array([])
-        
-        r0 = np.array([c.get('r0', 0.0) for c in items])
-        r_delta = np.array([c.get('r_delta', 0.0) for c in items])
-        
-        return r0, r_delta
-    
-    def get_diagnostics(self) -> Dict[str, Any]:
-        """Get diagnostic information"""
-        if not self.buffer:
-            return {'buffer_size': 0, 't': self.t}
-        
-        # Get recent buffer items
-        recent = self.buffer[-100:] if len(self.buffer) > 100 else self.buffer
-        
-        # Compute summary statistics
-        e_vals = [c.get('e_cf', c.get('e_hat', 0.5)) for c in recent]
-        
-        diag = {
-            'buffer_size': len(self.buffer),
-            't': self.t,
-            'e_mean': float(np.mean(e_vals)),
-            'e_min': float(np.min(e_vals)),
-            'e_max': float(np.max(e_vals)),
-            'clip_rate': float(np.mean([
-                e <= self.cfg.clip or e >= (1 - self.cfg.clip) 
-                for e in e_vals
-            ]))
+            return {}
+
+        groups = sorted({int(it.get(group_key, 0)) for it in items})
+        out: Dict[int, Tuple[float, float]] = {}
+        for g in groups:
+            y1, n1 = self.estimate_EY(arm=1, cond=(group_key, g))
+            y0, n0 = self.estimate_EY(arm=0, cond=(group_key, g))
+            te = float(y1 - y0)
+            n_eff = float(min(n1, n0))
+            out[int(g)] = (te, n_eff)
+        return out
+
+    def diagnostics(self) -> Dict[str, float]:
+        """Lightweight diagnostics for logging."""
+        tau_mode = str(getattr(self.cfg, "tau_mode", "global") or "global").strip().lower()
+        return {
+            "tau_mode_global": 1.0 if tau_mode == "global" else 0.0,
+            "tau_global": float(self.tau_global),
+            "tau_last_batch": float(self.last_tau_batch) if np.isfinite(self.last_tau_batch) else float("nan"),
+            "dr_buffer_len": float(len(self.buffer)),
         }
-        
-        # Add cross-fitter diagnostics if available
-        if self.cross_fitter is not None:
-            cf_diag = self.cross_fitter.get_model_diagnostics()
-            diag['cross_fitter'] = cf_diag
-        
-        return diag
+
+
 
 
 

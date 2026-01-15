@@ -1,0 +1,75 @@
+{
+  "dataset": "tgb",
+  "model": "TGN(adv=0.0, reweight=none, pen=0.0)",
+  "T": 2000,
+  "neg": 200,
+  "hits_k": 10,
+  "seed": 42,
+  "tgb_root": "/data1/shengen/fairlink/tgb_baselines",
+  "policy": "epsilon_greedy",
+  "topk": 1,
+  "epsilon": 0.1,
+  "temperature": 1.0,
+  "phase": {
+    "pre_T": 500,
+    "deploy_T": 500,
+    "post_T": 1000
+  },
+  "audit_every": 200,
+  "dr_cfg": {
+    "clip": 0.05,
+    "self_normalized": true,
+    "decay_gamma": 0.1,
+    "max_buffer": 200000,
+    "ratio_stab": true,
+    "winsor_eps": 0.02,
+    "min_eff_samples": 100,
+    "tau_mode": "global",
+    "tau_ema_alpha": 0.02,
+    "tau_init": 0.0
+  },
+  "aud_cfg": {
+    "buckets_per_group": 10,
+    "isotonic": false,
+    "budget_B": 64,
+    "step": 0.25,
+    "min_mass": 0.02
+  },
+  "covexp_cfg": {
+    "enabled": true,
+    "buckets_per_group": 10,
+    "score_window": 40000,
+    "update_buckets_every": 200,
+    "bucket_min_mass": 0.02,
+    "ema_window_rounds": 200,
+    "warmup_rounds": 50,
+    "ptar": 0.1,
+    "c": 1.0,
+    "eps_min": 0.0,
+    "eps_max": 0.5,
+    "only_consider_present_slices": true
+  },
+  "pd_cfg": {
+    "enabled": false,
+    "gamma_p": 0.2,
+    "gamma_i": 0.02,
+    "ramp_start": 0,
+    "ramp_end": 0,
+    "te_target": 0.05,
+    "cal_target": 0.05,
+    "te_target_start": null,
+    "cal_target_start": null,
+    "soften_by_beta": true,
+    "hierarchical": true,
+    "te_margin": 0.0,
+    "lambda_max": 50.0,
+    "offset_scale": 1.0,
+    "logit_clip": 2.0
+  },
+  "pd_apply_phases": [
+    "deploy",
+    "post"
+  ],
+  "crossfit": true,
+  "cf_folds": 5
+}

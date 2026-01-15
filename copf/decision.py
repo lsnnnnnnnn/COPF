@@ -59,7 +59,7 @@ def decide_with_exploration(
     epsilon: float,
     temperature: float,
     explore_mask: Optional[np.ndarray] = None,
-    epsilon_vec: Optional[np.ndarray] = None,  # Added for coverage-driven
+    epsilon_vec: Optional[np.ndarray] = None,
     mc_samples: int = 128,
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[List[int], List[float]]:
@@ -94,15 +94,18 @@ def decide_with_exploration(
     scores = np.array([float(c.get("p_hat", 0.5)) for c in cands], dtype=float)
     topk = int(max(0, min(topk, n)))
     
-    # Handle per-candidate exploration rates
+    # IMPORTANT (DR correctness): the logged propensities must match the
+    # actual sampling policy. We therefore implement a *single* exploration
+    # rate at the slate level (epsilon_avg). If a caller provides epsilon_vec,
+    # we reduce it to its mean. Per-candidate epsilon requires a different
+    # policy definition and entry-probability computation.
     if epsilon_vec is not None:
         epsilon_vec = np.asarray(epsilon_vec, dtype=float)
         assert epsilon_vec.shape[0] == n, f"epsilon_vec size {epsilon_vec.shape[0]} != n {n}"
-        epsilon_avg = float(epsilon_vec.mean())  # Average for slate-level decisions
+        epsilon_avg = float(np.mean(epsilon_vec))
     else:
-        epsilon_vec = np.full(n, epsilon, dtype=float)
         epsilon_avg = float(epsilon)
-    
+
     epsilon_avg = float(np.clip(epsilon_avg, 0.0, 1.0))
     temperature = float(max(1e-6, temperature))
     
@@ -110,8 +113,6 @@ def decide_with_exploration(
     idx_all = np.arange(n)
     if explore_mask is not None and explore_mask.dtype == bool and explore_mask.shape[0] == n:
         pool = idx_all[explore_mask]
-        # Boost epsilon for exploration candidates
-        epsilon_vec[explore_mask] = np.maximum(epsilon_vec[explore_mask], 0.2)
     else:
         pool = idx_all  # Fallback: all candidates
     
@@ -189,14 +190,6 @@ def decide_with_exploration(
                 slate = pool.tolist()
             else:
                 slate = rng.choice(pool, size=topk, replace=False).tolist()
-    
-    # Apply per-candidate exploration adjustments to propensities
-    for i in range(n):
-        if epsilon_vec[i] > epsilon_avg:
-            # Higher exploration rate for this candidate
-            boost = (epsilon_vec[i] - epsilon_avg) / (1.0 - epsilon_avg + 1e-6)
-            if i in pool:
-                entry[i] = entry[i] + boost * (1.0 - entry[i])
     
     # Ensure propensities are valid probabilities
     entry = np.clip(entry, 1e-6, 1.0 - 1e-6)

@@ -288,6 +288,25 @@ class OnlineCrossFitter:
             if arm == 1:
                 return min(1.0, base * 1.2)
             return base
+
+    # ------------------------------------------------------------------
+    # Compatibility aliases
+    # ------------------------------------------------------------------
+    # Some parts of the COPF pipeline expect a cross-fitter API that
+    # provides a single call returning both nuisance outcomes (mu0, mu1)
+    # and, occasionally, an alias for propensity prediction.
+    #
+    # The original OnlineCrossFitter exposes predict_outcome() and
+    # predict_propensity(); we provide thin wrappers for compatibility.
+    def predict_mu(self, c: Dict[str, Any], t: Optional[int] = None) -> Tuple[float, float]:
+        """Return (mu0, mu1) for candidate c."""
+        mu0 = self.predict_outcome(c, arm=0, t=t)
+        mu1 = self.predict_outcome(c, arm=1, t=t)
+        return float(mu0), float(mu1)
+
+    def predict_e(self, c: Dict[str, Any], t: Optional[int] = None) -> float:
+        """Alias for propensity prediction."""
+        return float(self.predict_propensity(c, t=t))
     
     def get_predictions_batch(self, cands: List[Dict[str, Any]], t: Optional[int] = None) -> Dict[str, np.ndarray]:
         """
