@@ -781,6 +781,39 @@ def main() -> None:
     ap.add_argument("--aud_min_mass", type=float, default=0.02)
     ap.add_argument("--aud_isotonic", action="store_true")
 
+    # Optional: make λ_Cal (dual variable) actually influence the primal calibrator.
+    # This is closer to Algorithm 1's spirit: primal updates should be weighted by λ.
+    # We implement a simple coupling: effective_aud_step = aud_step * min(1 + λ_Cal, cap).
+    ap.add_argument(
+        "--aud_step_lambda_scale",
+        action="store_true",
+        help="Scale calibrator updates by (1+lambdaCal) from PI primal-dual (recommended when --pd_enable).",
+    )
+    ap.add_argument(
+        "--aud_step_lambda_cap",
+        type=float,
+        default=5.0,
+        help="Cap on (1+lambdaCal) multiplier used to scale aud_step. (Default: 5.0)",
+    )
+    ap.add_argument(
+        "--aud_step_lambda_k",
+        type=float,
+        default=1.0,
+        help="Use (1 + k*lambdaCal) (then capped) when --aud_step_lambda_scale. (Default: 1.0)",
+    )
+    ap.add_argument(
+        "--aud_step_lambda_ignore_gate",
+        action="store_true",
+        help="If set, scale aud_step even when hierarchical cal-gate is closed (otherwise multiplier=1 when gate is closed).",
+    )
+
+    ap.add_argument(
+        "--aud_max_items",
+        type=int,
+        default=0,
+        help="Max number of DR buffer items used for each calibrator update. 0 means use --oi_window (recommended).",
+    )
+
     # DR knobs
     ap.add_argument("--dr_clip", type=float, default=0.05)
     ap.add_argument("--dr_decay_gamma", type=float, default=0.1)
@@ -1093,6 +1126,9 @@ def main() -> None:
     )
     calibrator = MultiCalibrator(cfg=aud_cfg)
 
+    # Track the last effective calibrator step scaling (for logging/plotting).
+    aud_last_step_scale = 1.0
+
     oi_cfg = OIAuditConfig(
         buckets_per_group=int(args.aud_buckets_per_group),
         min_mass=float(args.aud_min_mass),
@@ -1400,7 +1436,46 @@ def main() -> None:
 
         # calibration update from DR periodically (stable)
         if (i + 1) % int(args.audit_every) == 0:
-            calibrator.update_from_dr(dr_phase, max_items=5000, dr_clip=float(args.dr_clip))
+            # Optional: couple λ_Cal to the primal calibrator step size.
+            # This provides a practical primal-dual link: if gCal stays high, λ_Cal grows,
+            # which increases the calibrator learning rate (up to a cap).
+            step_scale = 1.0
+            if bool(getattr(args, "aud_step_lambda_scale", False)) and bool(pd_cfg.enabled):
+                try:
+                    lam_cal = float(getattr(pd_controller, "lambda_cal", 0.0))
+                except Exception:
+                    lam_cal = 0.0
+
+                # Respect hierarchical TE-first gating unless explicitly overridden.
+                if (not bool(getattr(args, "aud_step_lambda_ignore_gate", False))) and bool(pd_cfg.hierarchical):
+                    try:
+                        gate_open = bool(getattr(pd_controller, "_cal_gate_open", True))
+                    except Exception:
+                        gate_open = True
+                    if not gate_open:
+                        lam_cal = 0.0
+
+                cap = float(max(1.0, float(getattr(args, "aud_step_lambda_cap", 5.0))))
+                k = float(max(0.0, float(getattr(args, "aud_step_lambda_k", 1.0))))
+                step_scale = float(min(cap, 1.0 + k * max(0.0, lam_cal)))
+
+            aud_last_step_scale = float(step_scale)
+
+            # Important: align the calibrator's update window with the
+            # same window used by OI auditing (oi_window). Otherwise, the
+            # calibrator may optimize a different slice family than the
+            # one we log/certify.
+            aud_max_items = int(getattr(args, "aud_max_items", 0) or 0)
+            if aud_max_items <= 0:
+                oi_win = int(getattr(args, "oi_window", 0) or 0)
+                aud_max_items = int(oi_win) if oi_win > 0 else 5000
+
+            calibrator.update_from_dr(
+                dr_phase,
+                max_items=aud_max_items,
+                dr_clip=float(args.dr_clip),
+                step_scale=float(step_scale),
+            )
 
         # evaluate ranking metrics on current candidate set
         step_mrr = float(eval_mrr(cands))
@@ -1529,6 +1604,8 @@ def main() -> None:
                 "audit_n_active": aud_diag.get("n_active", 0),
                 "audit_beta_t": aud_diag.get("beta_t", np.nan),
                 "audit_total_samples": aud_diag.get("total_samples", 0),
+                "audit_step_scale": float(aud_last_step_scale),
+                "audit_step_eff": float(args.aud_step) * float(aud_last_step_scale),
 
                 # Step 2: coverage-driven exploration diagnostics (per-round)
                 "cov_enabled": float(cov_diag.get("cov_enabled", 0.0)) if isinstance(cov_diag, dict) else 0.0,

@@ -32,6 +32,20 @@ class AuditorConfig:
     # using aggressive steps (e.g., λCal-scaled updates).
     offset_clip: float = 5.0
 
+    # Learning-rate normalization.
+    #
+    # We want the calibrator to keep adapting in nonstationary online settings
+    # (temporal graphs drift). A purely cumulative 1/sqrt(count) schedule tends
+    # to freeze the calibrator after a few thousand samples, even if fairness
+    # violations re-emerge later.
+    #
+    # We therefore normalize by the *current batch size* only, with a reference
+    # count `lr_ref_n`: for buckets with >= lr_ref_n residual samples in the
+    # current update, we downscale the learning rate as 1/sqrt(n/lr_ref_n);
+    # otherwise we keep lr at the base step. This keeps lr <= base_step and
+    # prevents both explosion (small n) and freezing (large cumulative n).
+    lr_ref_n: int = 200
+
 
 class ActiveAuditorSet:
     """Maintains active set H^act of most violated auditors"""
@@ -171,10 +185,14 @@ class MultiCalibrator:
             violations[(g, bidx)] = avg_r
 
             key = (g, bidx)
+            # Track cumulative samples for diagnostics only.
             self.counts[key] = int(self.counts.get(key, 0) + len(residuals))
 
+            # Learning rate: batch-size normalized (see AuditorConfig.lr_ref_n).
             base_step = float(self.cfg.step) * float(max(0.0, step_scale))
-            lr = float(base_step / np.sqrt(max(1, self.counts[key])))
+            ref_n = float(max(1, int(getattr(self.cfg, "lr_ref_n", 200))))
+            # lr <= base_step, and decays as 1/sqrt(n/ref_n) for large buckets.
+            lr = float(base_step / np.sqrt(max(1.0, float(len(residuals)) / ref_n)))
             new_off = float(self.offsets.get(key, 0.0) + lr * avg_r)
             if float(self.cfg.offset_clip) > 0:
                 new_off = float(np.clip(new_off, -float(self.cfg.offset_clip), float(self.cfg.offset_clip)))
@@ -309,9 +327,13 @@ class MultiCalibrator:
             avg_r = float(np.mean(rs))
             violations[key] = avg_r
 
+            # Track cumulative samples for diagnostics only.
             self.counts[key] = int(self.counts.get(key, 0) + len(rs))
+
+            # Learning rate: batch-size normalized (see AuditorConfig.lr_ref_n).
             base_step = float(self.cfg.step) * float(max(0.0, step_scale))
-            lr = float(base_step / np.sqrt(max(1, self.counts[key])))
+            ref_n = float(max(1, int(getattr(self.cfg, "lr_ref_n", 200))))
+            lr = float(base_step / np.sqrt(max(1.0, float(len(rs)) / ref_n)))
             new_off = float(self.offsets.get(key, 0.0) + lr * avg_r)
             if float(self.cfg.offset_clip) > 0:
                 new_off = float(np.clip(new_off, -float(self.cfg.offset_clip), float(self.cfg.offset_clip)))
