@@ -1,16 +1,12 @@
-# FAIRLINK: COPF (Anonymous Artifact)
+# FAIRLINK: COPF
 
-This repository accompanies an **anonymous submission under review** on **deployment-stable counterfactual fairness** for **online link prediction / link recommendation** on evolving graphs.
+This repository accompanies our **deployment-stable counterfactual fairness** for **online link prediction / link recommendation** on evolving graphs.
 
-**Why online + counterfactual?** In deployed systems, link prediction is used to **choose exposures** (who/what to recommend). Exposures can change which edges form, creating **performative feedback loops**. We evaluate and control fairness using **decision-counterfactuals** (potential outcomes under *no exposure* vs *exposure*) and audit fairness **online** under a unified **Online Prequential Protocol (OPP)** with exploration + propensity logging.
-
----
-
-## What this artifact contains
+## This artifact contains
 
 - A unified **OPP** runner that logs utility + counterfactual fairness metrics over **Pre → Deploy → Post**
-- Backbones: **EdgeBank**, **TGN**, **GraphMixer** (as implemented in this repo)
-- COPF components (as toggled by flags in the runner):
+- Backbones: **EdgeBank**, **TGN**, **GraphMixer**, **TGN_Adv**, **TGN_Penalty**, **TGN_Reweight**
+- COPF components:
   - **Online auditing / certificates** (e.g., residual-style OI windowing)
   - **Coverage-driven exploration** (overlap/identification support)
   - **Primal–dual controller** to coordinate utility–fairness trade-offs
@@ -20,25 +16,11 @@ This repository accompanies an **anonymous submission under review** on **deploy
 ## Installation
 
 ### Requirements
-- Python 3.9+ (recommended: 3.10)
+- Python 3.9+ (recommended: 3.11)
 - PyTorch (CUDA optional)
-- numpy / pandas / scipy
-
-Install:
-```bash
-conda create -n fairlink python=3.10 -y
-conda activate fairlink
-pip install -r requirements.txt
-```
-
-> If your setup requires installing PyTorch (and possibly PyG) separately, do that first following official instructions,
-> then run `pip install -r requirements.txt`.
-
----
 
 ## Data (not included)
 
-This repository is prepared for **anonymous review**.  
 Due to **dataset size and licensing constraints**, we do **not** redistribute any TGB files, and we also do not upload pre-generated synthetic datasets.
 
 ### 1) TGB datasets (tgbl-wiki / tgbl-review)
@@ -83,7 +65,7 @@ Synthetic data can be generated locally (small files) and placed anywhere.
 ```bash
 python scripts/make_synth_bipartite.py \
   --out_dir data/synth/bipartite_v1/seed42 \
-  --seed 42 --n_users 600 --n_items 4000 --n_events 200000
+  --seed 2026 --n_users 600 --n_items 4000 --n_events 200000
 ```
 
 This writes (example):
@@ -106,7 +88,7 @@ python -u scripts/run_copf.py \
 
 ---
 
-## Reproducing results (reviewer-friendly)
+## Reproducing results
 
 ### Output format
 
@@ -116,8 +98,8 @@ Each run writes a folder under an output root (e.g., `out/`) containing:
 
 Example:
 ```bash
-out/<batch_name>/copf/tgn/seed42/opp_copf_metrics.csv
-out/<batch_name>/copf/tgn/seed42/run.log
+out/<batch_name>/copf/tgn/seed2026/opp_copf_metrics.csv
+out/<batch_name>/copf/tgn/seed2026/run.log
 ```
 
 ### Main batch script (TGB-Review)
