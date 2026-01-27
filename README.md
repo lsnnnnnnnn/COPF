@@ -109,14 +109,14 @@ Below is the exact batch script we use to run **EdgeBank / TGN / GraphMixer** on
 To keep the README readable, it is placed in a collapsible block—copy/paste as-is into a shell.
 
 <details>
-<summary><b>Click to expand: full batch script for tgbl-review (seeds 42/43/44)</b></summary>
+<summary><b>Click to expand: full batch script for tgbl-review (seeds 2026/2027/2028)</b></summary>
 
 ```bash
 bash <<'BASH'
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 
-SEEDS="42 43 44"
+SEEDS="2026 2027 2028"
 
 PRE_T=20000
 DEPLOY_T=20000
