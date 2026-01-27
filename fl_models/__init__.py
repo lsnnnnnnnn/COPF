@@ -1,3 +1,1 @@
-
-# re-export
-from .modules import TimeEncoder  # noqa: F401
+from .modules import TimeEncoder  
