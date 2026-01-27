@@ -1,6 +1,0 @@
-cat >> .gitignore <<'EOF'
-data/
-out/
-*.ipynb_checkpoints/
-EOF
-out_tgb/
