@@ -1,19 +1,4 @@
-# scripts/run_copf_v2_opp.py
 from __future__ import annotations
-
-"""A more paper-aligned OPP runner for COPF.
-
-What this version fixes/implements compared to your current run_copf_v1.py:
-  1) **OPP phases**: pre → deploy → post (Section 13) with per-phase policies.
-  2) **Correct score semantics**: always convert model outputs to probabilities in (0,1)
-     before calibration/decision/auditing.
-  3) **Correct fairness calls**: gTE is computed from DR; gCal returns a dict; we log max.
-  4) **Residual-OI auditing + noisy transfer certificate**: logs eps/beta/p_min bounds.
-  5) **GraphMixer group-map shift**: keeps group labels consistent after +1 node-id hack.
-
-This file is meant to be a drop-in replacement for scripts/run_copf_v1.py.
-"""
-
 import argparse
 import json
 import os
@@ -25,6 +10,7 @@ import importlib.util
 import inspect
 import types
 from collections import deque
+import bisect
 
 import numpy as np
 import pandas as pd
@@ -33,9 +19,7 @@ import torch
 import torch.nn as nn
 
 
-# ---------------------------------------------------------------------
-# Make repo root importable (so `import copf.*` works)
-# ---------------------------------------------------------------------
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -43,9 +27,7 @@ if REPO_ROOT not in sys.path:
 DEFAULT_TGB_ROOT = os.path.join(REPO_ROOT, "tgb_baselines")
 
 
-# ---------------------------------------------------------------------
-# COPF imports
-# ---------------------------------------------------------------------
+
 from copf.decision import decide_with_exploration
 from copf.propensity import log_propensities
 from copf.cross_fit import OnlineCrossFitter
@@ -59,20 +41,13 @@ from copf.eval import (
     export_phase_results,
 )
 from copf.fairness import gCal, gTE, gMin, gRisk
-
-# Coverage-driven exploration (Step 2)
+from copf.overlap_diag import OverlapDiagConfig, OverlapDiagnostics
 from copf.coverage import CoverageExplorerConfig, CoverageDrivenExplorer
-
-# Residual-OI auditing utilities (new file: copf/oi_audit.py)
 from copf.oi_audit import OIAuditConfig, ResidualOIAuditor
-
-# Primal-dual coordination (Step 3)
 from copf.primal_dual import PIDualConfig, PIDualController
 
 
-# ---------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------
+
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
@@ -109,20 +84,13 @@ def _push_sys_path_after_cwd(path0: str) -> None:
 
 
 def _as_prob(scores: np.ndarray) -> np.ndarray:
-    """Convert arbitrary model scores to probabilities in (0,1).
-
-    - If scores look like logits (outside [0,1]), apply sigmoid.
-    - Else treat as probabilities and clip.
-    """
     s = np.asarray(scores, dtype=float)
     if np.any(s < 0.0) or np.any(s > 1.0):
         s = 1.0 / (1.0 + np.exp(-s))
     return np.clip(s, 1e-4, 1.0 - 1e-4)
 
 
-# ---------------------------------------------------------------------
-# Compat modules for GraphMixer (same as your run_base)
-# ---------------------------------------------------------------------
+
 class CompatTimeEncoder(nn.Module):
     def __init__(self, time_dim: int, parameter_requires_grad: bool = True):
         super().__init__()
@@ -155,7 +123,7 @@ class CompatNeighborSampler:
         num_nodes: Optional[int] = None,
     ):
         self.seed = seed if seed is not None else 0
-        self.sample_neighbor_strategy = sample_neighbor_strategy
+        self.sample_neighbor_strategy = str(sample_neighbor_strategy)
         self._rng = np.random.default_rng(self.seed)
 
         src = np.asarray(src, dtype=np.int64)
@@ -171,22 +139,33 @@ class CompatNeighborSampler:
         else:
             self.num_nodes = int(num_nodes)
 
+        # adj[nid] is a list of (t, neighbor, eidx) sorted by t ascending.
         self.adj: List[List[Tuple[float, int, int]]] = [[] for _ in range(self.num_nodes)]
         for s, d, t, ei in zip(src, dst, ts, eidx):
             s = int(s)
             d = int(d)
+            t = float(t)
+            ei = int(ei)
             if 0 <= s < self.num_nodes:
-                self.adj[s].append((float(t), d, int(ei)))
+                self.adj[s].append((t, d, ei))
             if 0 <= d < self.num_nodes:
-                self.adj[d].append((float(t), s, int(ei)))
+                self.adj[d].append((t, s, ei))
 
         for nid in range(self.num_nodes):
             self.adj[nid].sort(key=lambda x: x[0])
 
+        # Parallel timestamp lists for fast bisect.
+        self.adj_ts: List[List[float]] = [[x[0] for x in self.adj[nid]] for nid in range(self.num_nodes)]
+
     def reset_random_state(self):
         self._rng = np.random.default_rng(self.seed)
 
-    def get_historical_neighbors(self, node_ids: np.ndarray, node_interact_times: np.ndarray, num_neighbors: int = 20):
+    def get_historical_neighbors(
+        self,
+        node_ids: np.ndarray,
+        node_interact_times: np.ndarray,
+        num_neighbors: int = 20,
+    ):
         node_ids = np.asarray(node_ids, dtype=np.int64).reshape(-1)
         cut_times = np.asarray(node_interact_times, dtype=np.float64).reshape(-1)
         B = len(node_ids)
@@ -196,24 +175,42 @@ class CompatNeighborSampler:
         nbr_eidx = np.zeros((B, K), dtype=np.int64)
         nbr_ts = np.zeros((B, K), dtype=np.float64)
 
+        strat = self.sample_neighbor_strategy.strip().lower()
+        uniform = ("uniform" in strat) or ("rand" in strat)
+
         for i, (nid, ct) in enumerate(zip(node_ids, cut_times)):
             nid = int(nid)
+            ct = float(ct)
+            # GraphMixer baseline reserves 0 for padding; keep behavior stable.
             if nid <= 0 or nid >= self.num_nodes:
                 continue
+
             hist = self.adj[nid]
             if not hist:
                 continue
 
-            picked: List[Tuple[float, int, int]] = []
-            for t, nb, ei in reversed(hist):
-                if t < ct:
-                    picked.append((t, nb, ei))
-                    if len(picked) >= K:
-                        break
-            picked.reverse()
+            ts_list = self.adj_ts[nid]
+            # idx is the first position with t >= ct, i.e., hist[:idx] are valid neighbors.
+            idx = bisect.bisect_left(ts_list, ct)
+            if idx <= 0:
+                continue
 
-            for j, (t, nb, ei) in enumerate(picked[-K:]):
-                nbr_ts[i, j] = float(t)
+            if uniform:
+                # Sample up to K neighbors uniformly from the valid prefix.
+                if idx <= K:
+                    picked = hist[:idx]
+                else:
+                    chosen = self._rng.choice(idx, size=K, replace=False)
+                    chosen.sort()
+                    picked = [hist[j] for j in chosen]
+            else:
+                # Most recent K neighbors from the valid prefix.
+                start = max(0, idx - K)
+                picked = hist[start:idx]
+
+            # picked is already in chronological order.
+            for j, (t_nb, nb, ei) in enumerate(picked[-K:]):
+                nbr_ts[i, j] = float(t_nb)
                 nb = int(nb)
                 nbr_nodes[i, j] = nb if (0 <= nb < self.num_nodes) else 0
                 nbr_eidx[i, j] = int(ei)
@@ -222,6 +219,7 @@ class CompatNeighborSampler:
 
     def get_temporal_neighbor(self, node_ids, node_interact_times, num_neighbors):
         return self.get_historical_neighbors(np.array(node_ids), np.array(node_interact_times), int(num_neighbors))
+
 
 
 def _install_graphmixer_compat_modules() -> None:
@@ -252,75 +250,34 @@ def _install_graphmixer_compat_modules() -> None:
         setattr(fl_utils_mod, "utils", utils_mod)
 
 
-# ---------------------------------------------------------------------
-# TGB EdgeBank Online Adapter
-# ---------------------------------------------------------------------
-class TGBEdgeBankOnlineAdapter:
-    def __init__(self, tgb_root: str):
-        self.tgb_root = tgb_root
+
+class EdgeBankOnline:
+
+    def __init__(self, undirected: bool = False):
+        self.undirected = bool(undirected)
         self._seen = set()
-
-        edgebank_py = os.path.join(tgb_root, "models", "EdgeBank.py")
-        if not os.path.exists(edgebank_py):
-            raise FileNotFoundError(f"EdgeBank.py not found at {edgebank_py}")
-
-        _push_sys_path_after_cwd(tgb_root)
-        _purge_modules("models")
-
-        try:
-            mod = _load_py_module_from_path("tgb_edgebank_mod", edgebank_py)
-            EdgeBankCls = _find_class_by_keyword(mod, "EdgeBank")
-            try:
-                self.model = EdgeBankCls()
-            except TypeError:
-                self.model = EdgeBankCls(None)
-            self._has_official = True
-        except Exception as e:
-            print(f"[WARN] Failed to load official TGB EdgeBank, fallback to seen-edge memory. Error: {e}")
-            self.model = None
-            self._has_official = False
 
     def score(self, u: int, v: int, t: int) -> float:
         u = int(u)
         v = int(v)
-        t = int(t)
-        if self._has_official and self.model is not None:
-            for fn_name in ["predict", "predict_proba", "predict_link_prob", "compute_edge_prob", "forward"]:
-                if hasattr(self.model, fn_name):
-                    fn = getattr(self.model, fn_name)
-                    try:
-                        out = fn(np.array([u]), np.array([v]), np.array([t]))
-                        return float(np.asarray(out).reshape(-1)[0])
-                    except Exception:
-                        pass
-        return 1.0 if (u, v) in self._seen else 0.0
+        if (u, v) in self._seen:
+            return 1.0
+        if self.undirected and (v, u) in self._seen:
+            return 1.0
+        return 0.0
 
     def update(self, u: int, v: int, t: int) -> None:
         u = int(u)
         v = int(v)
-        t = int(t)
         self._seen.add((u, v))
-        if self._has_official and self.model is not None:
-            for fn_name in ["update", "insert", "add_edge", "add_edges", "update_memory"]:
-                if hasattr(self.model, fn_name):
-                    fn = getattr(self.model, fn_name)
-                    try:
-                        fn(u, v, t)
-                        return
-                    except Exception:
-                        try:
-                            fn(np.array([u]), np.array([v]), np.array([t]))
-                            return
-                        except Exception:
-                            pass
+        if self.undirected:
+            self._seen.add((v, u))
 
     def diagnostics(self) -> Dict[str, Any]:
-        return {"model": "edgebank"}
+        return {"model": "edgebank_online", "seen_edges": int(len(self._seen))}
 
 
-# ---------------------------------------------------------------------
-# GraphMixer Config + Wrapper (same as your run_copf_v1)
-# ---------------------------------------------------------------------
+
 @dataclass
 class GraphMixerConfig:
     num_nodes: int
@@ -382,11 +339,20 @@ class GraphMixerWrapper:
         self.last_loss: float = float("nan")
 
     def _edge_logits(self, u: np.ndarray, v: np.ndarray, t: np.ndarray) -> torch.Tensor:
+        # GraphMixer uses `num_tokens` to configure internal LayerNorm shapes.
+        # The actual token dimension is controlled by how many neighbors are sampled.
+        # If `num_neighbors != num_tokens`, GraphMixer may crash with a shape mismatch
+        # (e.g., expected last dim = num_tokens but got num_neighbors).
+        num_tokens = int(self.cfg.gm_num_tokens)
+        num_neighbors = int(getattr(self.cfg, "gm_num_neighbors", num_tokens))
+        if num_neighbors != num_tokens:
+            # Keep behavior safe-by-default: force alignment to avoid runtime errors.
+            num_neighbors = num_tokens
         src_emb, dst_emb = self.model.compute_src_dst_node_temporal_embeddings(
             src_node_ids=u,
             dst_node_ids=v,
             node_interact_times=t,
-            num_neighbors=int(self.cfg.gm_num_neighbors),
+            num_neighbors=num_neighbors,
             time_gap=int(self.cfg.gm_time_gap),
         )
         logits = torch.sum(src_emb * dst_emb, dim=1)
@@ -424,9 +390,7 @@ class GraphMixerWrapper:
         return {"model": "graphmixer", "last_loss": self.last_loss}
 
 
-# ---------------------------------------------------------------------
-# Data loaders
-# ---------------------------------------------------------------------
+
 def _load_synth(data_dir: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Dict]:
     edges_path = os.path.join(data_dir, "edges.csv")
     nodes_path = os.path.join(data_dir, "nodes.csv")
@@ -448,12 +412,17 @@ def _load_synth(data_dir: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Di
 
 
 def _load_tgb_csv_robust(edgelist_csv: str) -> pd.DataFrame:
-    """Robust loader for:
-      - standard csv with headers (src,dst,t) / (u,i,ts) / etc.
-      - whitespace-separated DTDG timestamp files
-      - headerless comma-separated triples
-    """
-    edges = pd.read_csv(edgelist_csv)
+    edges = pd.read_csv(edgelist_csv, index_col=False)
+
+    def _finalize(df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only (src,dst,t), cast dtypes, and ensure chronological order."""
+        df = df[["src", "dst", "t"]].copy()
+        df["src"] = pd.to_numeric(df["src"], errors="raise").astype(int)
+        df["dst"] = pd.to_numeric(df["dst"], errors="raise").astype(int)
+        df["t"] = pd.to_numeric(df["t"], errors="raise").astype(float)
+        df = df.sort_values("t").reset_index(drop=True)
+        return df
+
     cols = list(edges.columns)
 
     # If it looks like a single text column, try alternative parsing.
@@ -465,7 +434,7 @@ def _load_tgb_csv_robust(edgelist_csv: str) -> pd.DataFrame:
                 if edges2.shape[1] >= 3:
                     edges2 = edges2.iloc[:, :3]
                     edges2.columns = ["src", "dst", "t"]
-                    return edges2
+                    return _finalize(edges2)
             except Exception:
                 pass
         raise ValueError(f"Could not parse '{edgelist_csv}'. It reads as a single column: {cols}.")
@@ -480,7 +449,7 @@ def _load_tgb_csv_robust(edgelist_csv: str) -> pd.DataFrame:
                 edges = edges.rename(columns={"time": "t"})
             else:
                 edges["t"] = np.arange(len(edges), dtype=np.int64)
-        return edges[["src", "dst", "t"]]
+        return _finalize(edges)
 
     if {"u", "i"}.issubset(cols_set):
         if "ts" in cols_set:
@@ -490,15 +459,15 @@ def _load_tgb_csv_robust(edgelist_csv: str) -> pd.DataFrame:
         else:
             edges = edges.rename(columns={"u": "src", "i": "dst"})
             edges["t"] = np.arange(len(edges), dtype=np.int64)
-        return edges[["src", "dst", "t"]]
+        return _finalize(edges)
 
     if {"user_id", "item_id", "timestamp"}.issubset(cols_set):
         edges = edges.rename(columns={"user_id": "src", "item_id": "dst", "timestamp": "t"})
-        return edges[["src", "dst", "t"]]
+        return _finalize(edges)
 
     if {"source", "target", "ts"}.issubset(cols_set):
         edges = edges.rename(columns={"source": "src", "target": "dst", "ts": "t"})
-        return edges[["src", "dst", "t"]]
+        return _finalize(edges)
 
     raise ValueError(f"Unrecognized edgelist columns: {list(edges.columns)}")
 
@@ -533,29 +502,7 @@ def _build_tgb_group_map(
     n_groups: int,
     warmup: int,
 ) -> Tuple[Dict[int, int], int, List[int]]:
-    """Construct a static protected-attribute map for TGB datasets.
-
-    TGB datasets typically don't ship demographic group labels. For OPP/COPF
-    experiments we often still need *some* notion of protected attribute A on
-    the *source* side. This helper builds a deterministic grouping based on
-    node IDs or (warm-start) degrees.
-
-    Args:
-        edges: DataFrame with columns [src, dst, t]
-        num_nodes: total number of nodes in the dataset
-        mode:
-            - 'none'      : a=0 for all sources
-            - 'src_mod'   : a = src % n_groups
-            - 'src_degree': a = quantile(deg(src)) using first `warmup` edges
-        n_groups: number of groups (>=1)
-        warmup: number of initial edges to estimate degrees for 'src_degree'
-
-    Returns:
-        group_map: dict {node_id -> group_id} (only for nodes that appear as src)
-        n_groups_found: effective number of groups (may be < n_groups if
-                        quantile cuts collapse)
-        groups_list: list of group IDs to use downstream
-    """
+    
     mode = str(mode).strip().lower()
     n_groups = max(1, int(n_groups))
     warmup = max(1, int(warmup))
@@ -563,21 +510,33 @@ def _build_tgb_group_map(
     if mode in {"none", ""}:
         return {}, 0, [0]
 
-    src_nodes = np.unique(edges["src"].to_numpy(dtype=np.int64))
-    if src_nodes.size == 0:
-        return {}, 0, [0]
+    
+    if mode == "mod":
+        mode = "node_mod"
+    if mode == "degree":
+        mode = "node_degree"
 
-    if mode == "src_mod":
-        gm = {int(u): int(u) % n_groups for u in src_nodes.tolist()}
+    
+    if mode in {"src_mod", "dst_mod", "node_mod"}:
+        gm = {int(u): int(u) % n_groups for u in range(int(num_nodes))}
         return gm, n_groups, list(range(n_groups))
 
-    if mode == "src_degree":
+    
+    if mode in {"src_degree", "dst_degree", "node_degree"}:
         warm = min(len(edges), warmup)
-        src_w = edges.iloc[:warm]["src"].to_numpy(dtype=np.int64)
-        deg = np.bincount(src_w, minlength=int(num_nodes)).astype(np.float64)
+        prefix = edges.iloc[:warm]
 
-        # Build quantile cut points; if they collapse (e.g., all degrees equal),
-        # fall back to fewer effective groups.
+        deg = (np.bincount(prefix["src"].to_numpy(dtype=np.int64), minlength=int(num_nodes)).astype(np.float64)
+               if mode == "src_degree" else np.zeros(int(num_nodes), dtype=np.float64))
+        if mode == "dst_degree":
+            deg = np.bincount(prefix["dst"].to_numpy(dtype=np.int64), minlength=int(num_nodes)).astype(np.float64)
+        elif mode == "node_degree":
+            deg = (
+                np.bincount(prefix["src"].to_numpy(dtype=np.int64), minlength=int(num_nodes)).astype(np.float64)
+                + np.bincount(prefix["dst"].to_numpy(dtype=np.int64), minlength=int(num_nodes)).astype(np.float64)
+            )
+
+        
         if n_groups == 1:
             cuts = np.array([], dtype=np.float64)
         else:
@@ -588,15 +547,13 @@ def _build_tgb_group_map(
         n_eff = max(1, int(len(cuts) + 1))
         grp = np.digitize(deg, bins=cuts, right=False).astype(np.int64)
 
-        gm = {int(u): int(grp[int(u)]) for u in src_nodes.tolist()}
+        gm = {int(u): int(grp[int(u)]) for u in range(int(num_nodes))}
         return gm, n_eff, list(range(n_eff))
 
     raise ValueError(f"Unknown --tgb_group_mode='{mode}'.")
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser()
 
@@ -624,11 +581,11 @@ def main() -> None:
         "--tgb_group_mode",
         type=str,
         default="none",
-        choices=["none", "src_mod", "src_degree"],
+        choices=["none", "src_mod", "src_degree", "dst_mod", "dst_degree", "node_mod", "node_degree"],
         help=(
-            "How to construct protected group A for --dataset tgb. "
+            "How to construct protected group labels on datasets without demographic A. "
             "none: all sources in group 0. "
-            "src_mod: a = src_id % tgb_group_n. "
+            "src_mod: group(node) = node_id mod tgb_group_n. "
             "src_degree: a = quantile(degree(src)) computed from the first tgb_group_warmup edges."
         ),
     )
@@ -645,6 +602,20 @@ def main() -> None:
         help="How many first edges to estimate degrees for --tgb_group_mode=src_degree (default: 20000).",
     )
 
+
+    # Which node's group label to use as protected attribute A in COPF metrics/policy.
+    # NOTE: default 'dst' makes the TE-bias (logit shift) capable of changing ranking under topk=1.
+    ap.add_argument(
+        "--group_on",
+        type=str,
+        default="dst",
+        choices=["src", "dst"],
+        help=(
+            "Which node's group label defines protected attribute A for auditing/control. "
+            "src: A=group(src) (may not affect ranking when topk=1). "
+            "dst: A=group(dst) per-candidate (recommended for TE-parity control in this runner)."
+        ),
+    )
     ap.add_argument("--tgb_root", type=str, default=DEFAULT_TGB_ROOT)
 
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -781,9 +752,7 @@ def main() -> None:
     ap.add_argument("--aud_min_mass", type=float, default=0.02)
     ap.add_argument("--aud_isotonic", action="store_true")
 
-    # Optional: make λ_Cal (dual variable) actually influence the primal calibrator.
-    # This is closer to Algorithm 1's spirit: primal updates should be weighted by λ.
-    # We implement a simple coupling: effective_aud_step = aud_step * min(1 + λ_Cal, cap).
+    
     ap.add_argument(
         "--aud_step_lambda_scale",
         action="store_true",
@@ -815,6 +784,17 @@ def main() -> None:
     )
 
     # DR knobs
+    ap.add_argument(
+        "--dr_estimator",
+        type=str,
+        default="dr",
+        choices=["dr", "ips", "obs"],
+        help=(
+            "Estimator used to build GA pseudo-outcomes inside the DR buffer. "
+            "dr: doubly robust (default); ips: inverse propensity scoring only; "
+            "obs: observed-only (naive; uses only factual-arm samples)."
+        ),
+    )
     ap.add_argument("--dr_clip", type=float, default=0.05)
     ap.add_argument("--dr_decay_gamma", type=float, default=0.1)
     ap.add_argument("--dr_max_buffer", type=int, default=200000)
@@ -822,6 +802,23 @@ def main() -> None:
     ap.add_argument("--dr_min_eff", type=int, default=100)
     ap.add_argument("--dr_no_sn", action="store_true")
     ap.add_argument("--dr_no_ratio_stab", action="store_true")
+
+    # Overlap / clipping diagnostics (Appendix)
+    ap.add_argument(
+        "--diag_overlap",
+        action="store_true",
+        help=(
+            "If set, write overlap/clipping diagnostics to out_dir: "
+            "overlap_diag_summary.csv and overlap_diag_propensity_hist.csv "
+            "(by phase and group)."
+        ),
+    )
+    ap.add_argument(
+        "--diag_prop_bins",
+        type=int,
+        default=20,
+        help="Number of bins for the propensity histogram (default: 20).",
+    )
 
     # τ(x) target for r(Δ):
     #  - 'global' (recommended for TE-parity certificates; τ cancels in group differences)
@@ -853,9 +850,7 @@ def main() -> None:
     # gMin threshold (if <0, we set it from pre phase 10th percentile of tau)
     ap.add_argument("--tau_min", type=float, default=-1.0)
 
-    # ============================================================
-    # Step 3: primal-dual (PI controller) + hierarchical priorities
-    # ============================================================
+    
     ap.add_argument("--pd_enable", action="store_true", help="Enable PI primal-dual updates (policy bias).")
     ap.add_argument("--pd_gamma_p", type=float, default=0.2)
     ap.add_argument("--pd_gamma_i", type=float, default=0.02)
@@ -888,9 +883,7 @@ def main() -> None:
 
     rng = np.random.default_rng(args.seed)
 
-    # ============================================================
-    # Load data
-    # ============================================================
+    
     if args.dataset == "synth":
         edges, nodes, meta = _load_synth(args.data_dir)
         group_map, n_groups_found = _build_group_map_from_nodes(nodes)
@@ -920,9 +913,7 @@ def main() -> None:
             warmup=int(args.tgb_group_warmup),
         )
 
-    # ============================================================
-    # Step 2: coverage-driven exploration (optional)
-    # ============================================================
+    
     cov_cfg = CoverageExplorerConfig(
         enabled=bool(getattr(args, "covexp_enable", False)),
         buckets_per_group=int(
@@ -944,9 +935,7 @@ def main() -> None:
 
     T_total = min(int(args.T), len(edges))
 
-    # ============================================================
-    # OPP phase split
-    # ============================================================
+    
     if int(args.pre_T) > 0:
         pre_T = int(args.pre_T)
         deploy_T = int(args.deploy_T)
@@ -978,12 +967,11 @@ def main() -> None:
             return topk, eps, temp
         return int(args.topk), float(args.epsilon), float(args.temperature)
 
-    # ============================================================
-    # Initialize model
-    # ============================================================
+    
     if args.model == "edgebank":
-        model = TGBEdgeBankOnlineAdapter(tgb_root=args.tgb_root)
-        model_name = "EdgeBank"
+        # Pure online EdgeBank (unlimited memory)
+        model = EdgeBankOnline(undirected=False)
+        model_name = "EdgeBankOnline"
         edges_use = edges
         # Candidate pool for negative sampling.
         # For bipartite synth: restrict candidates to the item side.
@@ -1085,9 +1073,7 @@ def main() -> None:
         with open(os.path.join(args.out_dir, "tgn_config.json"), "w") as f:
             json.dump(asdict(cfg), f, indent=2)
 
-    # ============================================================
-    # COPF components: Cross-fit + GA-DR + Residual-OI calibrator
-    # ============================================================
+    
     cross_fitter = None
     if not args.no_crossfit:
         cross_fitter = OnlineCrossFitter(
@@ -1097,6 +1083,7 @@ def main() -> None:
         )
 
     dr_cfg = DRConfig(
+        estimator=str(getattr(args, "dr_estimator", "dr")),
         clip=float(args.dr_clip),
         self_normalized=(not args.dr_no_sn),
         decay_gamma=float(args.dr_decay_gamma),
@@ -1113,6 +1100,17 @@ def main() -> None:
     dr_pre = GraphAwareDR(dr_cfg, cross_fitter=cross_fitter)
     dr_deploy = GraphAwareDR(dr_cfg, cross_fitter=cross_fitter)
     dr_post = GraphAwareDR(dr_cfg, cross_fitter=cross_fitter)
+
+    # Optional appendix diagnostics: overlap / clipping / ESS / propensity hist.
+    overlap_diag: Optional[OverlapDiagnostics] = None
+    if bool(getattr(args, "diag_overlap", False)):
+        overlap_diag = OverlapDiagnostics(
+            OverlapDiagConfig(
+                prop_bins=int(getattr(args, "diag_prop_bins", 20)),
+                clip=float(args.dr_clip),
+                ratio_stab=(not bool(args.dr_no_ratio_stab)),
+            )
+        )
 
     def _dr_for_phase(ph: str) -> GraphAwareDR:
         return dr_pre if ph == "pre" else (dr_deploy if ph == "deploy" else dr_post)
@@ -1144,9 +1142,7 @@ def main() -> None:
     )
     oi_auditor = ResidualOIAuditor(cfg=oi_cfg)
 
-    # ============================================================
-    # Step 3: PI primal-dual controller (optional)
-    # ============================================================
+    
     pd_cfg = PIDualConfig(
         enabled=bool(getattr(args, "pd_enable", False)),
         gamma_p=float(getattr(args, "pd_gamma_p", 0.2)),
@@ -1175,12 +1171,20 @@ def main() -> None:
         pd_apply_phases = {p for p in pd_apply_phases if p in {"pre", "deploy", "post"}}
 
 
-    # ============================================================
-    # Simple online structural stats for x (features for nuisance models / kernel auditing)
-    # ============================================================
+    
     degree: Dict[int, int] = {}
     last_time: Dict[int, float] = {}
     t0: Optional[float] = None
+
+    group_on = str(getattr(args, 'group_on', 'dst')).strip().lower()
+    if group_on not in {'src', 'dst'}:
+        group_on = 'dst'
+    print(
+        f"[INFO] dataset={args.dataset} model={args.model} num_nodes={num_nodes} "
+        f"bipartite={bool(args.bipartite)} n_users={n_users} "
+        f"group_on={group_on} n_groups={n_groups_found} groups={groups_list}"
+    )
+
 
     def _make_x(u: int, v: int, t: float) -> Dict[str, Any]:
         du = float(degree.get(u, 0))
@@ -1204,9 +1208,7 @@ def main() -> None:
             "time_since_start": float(0.0 if t0 is None else max(0.0, t - t0)),
         }
 
-    # ============================================================
-    # Online loop
-    # ============================================================
+    
     rows: List[Dict[str, Any]] = []
     phase_results: Dict[str, Dict[str, Any]] = {}
 
@@ -1290,7 +1292,7 @@ def main() -> None:
                 vals = [float(v) for (v, n) in te.values() if n > 0]
                 tau_min_value = float(np.percentile(np.asarray(vals, float), 10)) if vals else 0.0
 
-        gmin = float(gMin(dr_audit, tau_min=float(tau_min_value or 0.0)))
+        gmin = float(gMin(dr_audit, tau_min=float(tau_min_value or 0.0), groups=groups_list))
         grisk = float(gRisk(dr_audit, groups_list))
 
         # residual-OI + transfer certificate
@@ -1323,7 +1325,7 @@ def main() -> None:
         util_sum = {"mrr": 0.0, "ap": 0.0, "hits": 0.0, "ndcg": 0.0, "deploy_hit": 0.0}
         util_n = 0
 
-    # ---------------- main streaming loop ----------------
+    
     for i in range(T):
         phase = _phase(i)
         if phase != phase_cur:
@@ -1338,8 +1340,8 @@ def main() -> None:
         if t0 is None:
             t0 = t
 
-        # group id a (protected attribute)
-        a = int(group_map.get(src, 0)) if group_map else 0
+        # group labels
+        src_group = int(group_map.get(src, 0)) if group_map else 0
 
         # candidate pool
         k = min(int(args.neg), len(item_pool))
@@ -1351,18 +1353,22 @@ def main() -> None:
         if args.model == "edgebank":
             raw = np.array([float(model.score(src, int(v), int(t))) for v in cand_vs], dtype=float)
         else:
-            raw = model.score(src, cand_vs.tolist(), int(t), src_group=a)
+            raw = model.score(src, cand_vs.tolist(), int(t), src_group=src_group)
         scores = _as_prob(raw)
 
         # build candidates
         cands: List[Dict[str, Any]] = []
         for v, p in zip(cand_vs.tolist(), scores.tolist()):
+            if group_on == 'src':
+                a_cand = int(src_group)
+            else:
+                a_cand = int(group_map.get(int(v), 0)) if group_map else 0
             cands.append(
                 {
                     "u": int(src),
                     "v": int(v),
                     "t": int(t),
-                    "a": int(a),
+                    "a": int(a_cand),
                     "y_true": 1.0 if int(v) == int(dst_true) else 0.0,
                     "x": _make_x(int(src), int(v), float(t)),
                     "p_hat": float(p),
@@ -1373,7 +1379,8 @@ def main() -> None:
         pd_apply_diag = {"pd_shift_abs_mean": 0.0, "pd_shift_abs_max": 0.0, "pd_shift_nonzero": 0.0}
         if bool(pd_cfg.enabled) and (phase in pd_apply_phases):
             tau_by_group = dr_phase.estimate_TE_by_group(group_key="a")
-            pd_offsets = pd_controller.group_logit_offsets(tau_by_group)
+            tau_min_for_pd = float(tau_min_value or 0.0)
+            pd_offsets = pd_controller.group_logit_offsets(tau_by_group, tau_min=tau_min_for_pd)
             pd_apply_diag = pd_controller.apply_te_bias_to_candidates(cands, pd_offsets, store_debug=True)
         else:
             pd_offsets = {}
@@ -1402,17 +1409,14 @@ def main() -> None:
         )
         log_propensities(cands, d_list, e_list)
 
+        # Appendix diagnostics: overlap / clipping / ESS / propensity hist (by group/phase)
+        if overlap_diag is not None:
+            overlap_diag.update(cands, phase=phase)
+
         # Update coverage tracker with realized exposures
         cov_explorer.update(cands, d_list)
 
-        # ---------------------------------------------------------------------
-        # Observed outcomes used by the OPP / DR estimator.
-        #
-        # - outcome_mode=bandit (recommended for OPP): only exposed candidates
-        #   generate feedback, i.e. y = y_true if d==1 else 0.
-        # - outcome_mode=full: offline full-information logging, y = y_true for
-        #   every candidate (useful only for debugging; TE will collapse).
-        # ---------------------------------------------------------------------
+        
         outcome_mode = str(args.outcome_mode).strip().lower()
         for c in cands:
             y_true = float(c.get("y_true", 0.0))
@@ -1423,22 +1427,17 @@ def main() -> None:
                 c["y"] = y_true
             c["w_local"] = 1.0
 
-        # Cross-fit nuisance update:
-        # We always ingest new samples into the buffer, but only refit
-        # the nuisance models every cf_update_every rounds (refit is expensive).
+        
         if cross_fitter is not None:
             cf_every = max(1, int(args.cf_update_every))
             do_refit = ((i + 1) % cf_every == 0)
             cross_fitter.update(cands, train=do_refit)
 
-        # DR ingest (phase-specific buffer)
+        
         dr_phase.ingest(cands)
 
-        # calibration update from DR periodically (stable)
+       
         if (i + 1) % int(args.audit_every) == 0:
-            # Optional: couple λ_Cal to the primal calibrator step size.
-            # This provides a practical primal-dual link: if gCal stays high, λ_Cal grows,
-            # which increases the calibrator learning rate (up to a cap).
             step_scale = 1.0
             if bool(getattr(args, "aud_step_lambda_scale", False)) and bool(pd_cfg.enabled):
                 try:
@@ -1446,7 +1445,6 @@ def main() -> None:
                 except Exception:
                     lam_cal = 0.0
 
-                # Respect hierarchical TE-first gating unless explicitly overridden.
                 if (not bool(getattr(args, "aud_step_lambda_ignore_gate", False))) and bool(pd_cfg.hierarchical):
                     try:
                         gate_open = bool(getattr(pd_controller, "_cal_gate_open", True))
@@ -1461,9 +1459,7 @@ def main() -> None:
 
             aud_last_step_scale = float(step_scale)
 
-            # Important: align the calibrator's update window with the
-            # same window used by OI auditing (oi_window). Otherwise, the
-            # calibrator may optimize a different slice family than the
+            
             # one we log/certify.
             aud_max_items = int(getattr(args, "aud_max_items", 0) or 0)
             if aud_max_items <= 0:
@@ -1484,23 +1480,21 @@ def main() -> None:
         step_ndcg = float(eval_ndcg(cands, int(args.hits_k)))
 
         deployed_hit = 1.0 if any((c.get("y_true", 0.0) == 1.0 and c.get("d", 0) == 1) for c in cands) else 0.0
+        
+        if outcome_mode == 'full' or deployed_hit > 0.0:
+            if args.model == 'edgebank':
+                model.update(src, dst_true, int(t))
+            else:
+                model.update(src, dst_true, neg_vs.tolist(), int(t), src_group=src_group)
 
-        # model update (same supervision as baselines)
-        if args.model == "edgebank":
-            model.update(src, dst_true, int(t))
-        else:
-            model.update(src, dst_true, neg_vs.tolist(), int(t), src_group=a)
-
-        # Update simple structural stats used as covariates (degree/recency).
-        #
-        # In bandit outcome mode, we only "observe" the positive (u, dst_true)
-        # interaction when we actually expose the true dst (deployed_hit==1).
-        degree[src] = degree.get(src, 0) + 1
-        last_time[src] = float(t)
-
-        if str(args.outcome_mode).lower() == "full" or deployed_hit > 0.0:
+            # Update simple structural stats used as covariates (degree/recency).
+            degree[src] = degree.get(src, 0) + 1
+            last_time[src] = float(t)
             degree[dst_true] = degree.get(dst_true, 0) + 1
             last_time[dst_true] = float(t)
+        else:
+            # No realized edge under bandit semantics -> do not update model/graph.
+            pass
 
         # accumulators
         util_sum["mrr"] += step_mrr
@@ -1555,6 +1549,11 @@ def main() -> None:
             )
             gcal_max = float(max(gcal_dict.values())) if gcal_dict else 0.0
 
+            # minimum-effect guard (gMin) on the same audit window
+            tau_min_for_metrics = float(tau_min_value or 0.0)
+            gmin = float(gMin(dr_audit, tau_min=tau_min_for_metrics, groups=groups_list))
+
+
             oi = oi_auditor.audit(audit_items, groups=groups_list)
 
             aud_diag = calibrator.get_diagnostics()
@@ -1568,8 +1567,10 @@ def main() -> None:
                 total_T=int(T),
                 gte_gap=float(gte_gap),
                 gcal_max=float(gcal_max),
+                gmin=float(gmin),
                 beta_te=float(beta_te_pd),
                 beta_cal=float(beta_cal_pd),
+                beta_min=float(beta_te_pd),
             )
 
             row: Dict[str, Any] = {
@@ -1585,6 +1586,7 @@ def main() -> None:
                 "gTE_gap": gte_gap,
                 "gCal_max": gcal_max,
                 "gCal_max_all": gcal_max_all,
+                "gMin": float(gmin),
                 "bound_gTE_gap": float(oi.get("bound_gTE_gap", float("nan"))),
                 "bound_gCal_max": float(oi.get("bound_gCal_max", float("nan"))),
 
@@ -1620,6 +1622,10 @@ def main() -> None:
                 "pd_enabled": float(pd_update_diag.get("pd_enabled", 0.0)),
                 "lambda_te": float(pd_update_diag.get("lambda_te", 0.0)),
                 "lambda_cal": float(pd_update_diag.get("lambda_cal", 0.0)),
+                "lambda_min": float(pd_update_diag.get("lambda_min", 0.0)),
+                "rho_min": float(pd_update_diag.get("rho_min", float('nan'))),
+                "pd_gmin_soft": float(pd_update_diag.get("gmin_soft", float('nan'))),
+                "pd_v_min": float(pd_update_diag.get("v_min", float('nan'))),
                 "rho_te": float(pd_update_diag.get("rho_te", float("nan"))),
                 "rho_cal": float(pd_update_diag.get("rho_cal", float("nan"))),
                 "pd_cal_gate_open": float(pd_update_diag.get("cal_gate_open", 0.0)),
@@ -1687,6 +1693,7 @@ def main() -> None:
             if float(row.get("pd_enabled", 0.0)) > 0.5:
                 extra += (
                     f"lambdaTE={row.get('lambda_te', 0.0):.4f} "
+                    f"lambdaMin={row.get('lambda_min', 0.0):.4f} "
                     f"lambdaCal={row.get('lambda_cal', 0.0):.4f} "
                     f"rhoTE={row.get('rho_te', np.nan):.4f} "
                     f"rhoCal={row.get('rho_cal', np.nan):.4f} "
@@ -1748,6 +1755,14 @@ def main() -> None:
             indent=2,
             default=str,
         )
+
+    # Optional appendix diagnostics
+    if overlap_diag is not None:
+        try:
+            sum_path, hist_path = overlap_diag.write(args.out_dir)
+            print(f"[OK] wrote overlap diagnostics: {sum_path} and {hist_path}")
+        except Exception as e:
+            print(f"[WARN] failed to write overlap diagnostics: {e}")
 
     print(f"[OK] wrote {out_csv}")
 

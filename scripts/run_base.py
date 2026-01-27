@@ -18,9 +18,7 @@ import torch
 import torch.nn as nn
 
 
-# ---------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
@@ -51,32 +49,20 @@ def _find_class_by_keyword(mod, keyword: str):
 
 
 def _purge_modules(prefix: str) -> None:
-    """Remove already-imported modules with a given prefix from sys.modules."""
     keys = [k for k in list(sys.modules.keys()) if k == prefix or k.startswith(prefix + ".")]
     for k in keys:
         del sys.modules[k]
 
 
 def _push_sys_path_after_cwd(path0: str) -> None:
-    """
-    Put tgb_root AFTER '' (cwd) so fairlink's local packages win by default.
-    But for GraphMixer we will patch fl_utils/fl_models anyway.
-    """
     if path0 in sys.path:
         sys.path.remove(path0)
     insert_pos = 1 if (len(sys.path) > 0 and sys.path[0] == "") else 0
     sys.path.insert(insert_pos, path0)
 
 
-# ---------------------------------------------------------------------
-# Compat modules for GraphMixer (fix fl_utils.utils.NeighborSampler and fl_models.modules.TimeEncoder)
-# ---------------------------------------------------------------------
+
 class CompatTimeEncoder(nn.Module):
-    """
-    Minimal compatible TimeEncoder:
-      - accepts parameter_requires_grad (GraphMixer passes it)
-      - forward(timestamps=...) returns cos(W*t + b) with shape (..., time_dim)
-    """
     def __init__(self, time_dim: int, parameter_requires_grad: bool = True):
         super().__init__()
         self.time_dim = int(time_dim)
@@ -97,17 +83,6 @@ class CompatTimeEncoder(nn.Module):
 
 
 class CompatNeighborSampler:
-    """
-    A robust neighbor sampler that implements:
-      - get_historical_neighbors(node_ids, node_interact_times, num_neighbors) -> (nbr_nodes, nbr_eidx, nbr_ts)
-    Using a per-node time-sorted adjacency.
-
-    IMPORTANT: node_id=0 is reserved for padding. So this sampler assumes you SHIFTED real node ids by +1.
-    Edge ids also start from 1; 0 is padding.
-
-    FIX: must be initialized with a GLOBAL num_nodes (from meta), because negatives may include isolated nodes
-    not present in edges; otherwise IndexError when nid > max observed id in edges.
-    """
     def __init__(
         self,
         src: np.ndarray,
@@ -197,12 +172,6 @@ class CompatNeighborSampler:
 
 
 def _install_graphmixer_compat_modules() -> None:
-    """
-    Ensure that when GraphMixer.py does:
-      from fl_models.modules import TimeEncoder
-      from fl_utils.utils import NeighborSampler
-    it sees compatible implementations.
-    """
     # patch fl_models.modules.TimeEncoder
     try:
         import fl_models.modules as fm  # type: ignore
@@ -232,9 +201,7 @@ def _install_graphmixer_compat_modules() -> None:
         setattr(fl_utils_mod, "utils", utils_mod)
 
 
-# ---------------------------------------------------------------------
-# TGB EdgeBank Online Adapter
-# ---------------------------------------------------------------------
+
 class TGBEdgeBankOnlineAdapter:
     def __init__(self, tgb_root: str):
         self.tgb_root = tgb_root
@@ -294,9 +261,7 @@ class TGBEdgeBankOnlineAdapter:
         return {"model": "edgebank"}
 
 
-# ---------------------------------------------------------------------
-# GraphMixer Config + Wrapper
-# ---------------------------------------------------------------------
+
 @dataclass
 class GraphMixerConfig:
     num_nodes: int
@@ -405,9 +370,7 @@ class GraphMixerWrapper:
         return {"model": "graphmixer", "last_loss": self.last_loss}
 
 
-# ---------------------------------------------------------------------
-# Data loaders
-# ---------------------------------------------------------------------
+
 def _load_synth(data_dir: str) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Dict]:
     edges_path = os.path.join(data_dir, "edges.csv")
     nodes_path = os.path.join(data_dir, "nodes.csv")
@@ -432,9 +395,7 @@ def _load_tgb_csv(edgelist_csv: str) -> pd.DataFrame:
     edges = pd.read_csv(edgelist_csv)
     cols = set(edges.columns)
 
-    # --------------------------------------------------
-    # Case 1: minimal edgelist: src, dst, t
-    # --------------------------------------------------
+    
     if {"src", "dst"}.issubset(cols):
         if "t" not in cols:
             if "ts" in cols:
@@ -445,9 +406,7 @@ def _load_tgb_csv(edgelist_csv: str) -> pd.DataFrame:
                 edges["t"] = np.arange(len(edges), dtype=np.int64)
         return edges[["src", "dst", "t"]]
 
-    # --------------------------------------------------
-    # Case 2: alternative minimal: u, i, ts
-    # --------------------------------------------------
+    
     if {"u", "i"}.issubset(cols):
         if "ts" in cols:
             edges = edges.rename(columns={"u": "src", "i": "dst", "ts": "t"})
@@ -458,10 +417,7 @@ def _load_tgb_csv(edgelist_csv: str) -> pd.DataFrame:
             edges["t"] = np.arange(len(edges), dtype=np.int64)
         return edges[["src", "dst", "t"]]
 
-    # --------------------------------------------------
-    # Case 3: TGB wiki / review CSV
-    #   user_id, item_id, timestamp, (others ignored)
-    # --------------------------------------------------
+    
     if {"user_id", "item_id", "timestamp"}.issubset(cols):
         edges = edges.rename(columns={
             "user_id": "src",
@@ -470,10 +426,7 @@ def _load_tgb_csv(edgelist_csv: str) -> pd.DataFrame:
         })
         return edges[["src", "dst", "t"]]
 
-# --------------------------------------------------
-# Case 4: DTDG-style TGB CSV (review, citation, etc.)
-#   source, target, ts, (weight ignored)
-# --------------------------------------------------
+
     if {"source", "target", "ts"}.issubset(cols):
         edges = edges.rename(columns={
             "source": "src",
@@ -481,9 +434,7 @@ def _load_tgb_csv(edgelist_csv: str) -> pd.DataFrame:
             "ts": "t",
         })
         return edges[["src", "dst", "t"]]
-    # --------------------------------------------------
-    # Otherwise: unsupported format
-    # --------------------------------------------------
+    
     raise ValueError(f"Unrecognized edgelist columns: {list(edges.columns)}")
 
 
@@ -517,19 +468,6 @@ def _build_tgb_group_map(
     n_groups: int = 2,
     warmup: int = 20000,
 ) -> Tuple[Dict[int, int], int, List[int]]:
-    """Build a *synthetic* protected-group map for TGB datasets.
-
-    TGB datasets do not ship with a protected attribute in this repo. For experiments that need
-    groups (e.g., TGN adversarial debiasing / penalty baselines, and OPP-COPF fairness metrics),
-    we optionally create groups from node IDs or simple structural stats.
-
-    Modes:
-      - none: every node in group 0
-      - src_mod: group(u) = u % n_groups
-      - src_degree: degree bucket of src node based on a warmup prefix
-
-    Returns: (group_map, n_groups_found, groups_list)
-    """
     mode = str(mode).lower().strip()
     if mode == "none":
         return {}, 0, [0]
@@ -576,9 +514,7 @@ def _rank_of_positive(v_list: np.ndarray, scores: np.ndarray, v_pos: int) -> int
     return idx + 1
 
 
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=["synth", "tgb"], required=True)
@@ -750,9 +686,7 @@ def main() -> None:
         with open(os.path.join(args.out_dir, "tgn_config.json"), "w") as f:
             json.dump(asdict(cfg), f, indent=2)
 
-    # -----------------------------------------------------------------
-    # Online loop
-    # -----------------------------------------------------------------
+    
     rows = []
     w_mrr = 0.0
     w_ap = 0.0

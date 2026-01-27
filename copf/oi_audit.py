@@ -1,50 +1,3 @@
-"""copf/oi_audit.py
-
-Residual-OI auditing for COPF.
-
-This module provides:
-  - OIAuditConfig: configuration for discrete (bucketed) + optional RFF (RKHS) auditors.
-  - ResidualOIAuditor: the main interface used by scripts/run_copf.py.
-
-Paper-alignment notes (COPF / Residual-OI):
-  * We audit residual opportunity imbalance over *slices* S ⊆ X × A × R:
-      - A: protected attribute / group
-      - score buckets (within group)
-      - optional structural roles / coarse structure features
-  * When GA (graph-aware) weights are used (w_local + time decay),
-    ALL expectations in the auditor are computed as GA-weighted self-normalized means:
-        E_GA[f] = (Σ w_i f_i) / (Σ w_i)
-
-Important runner compatibility detail:
--------------------------------------
-`scripts/run_copf.py` calls:
-    oi_auditor.audit(dr_phase.buffer, groups=groups_list)
-
-where `groups_list` is typically the *set of group IDs* (e.g., [0,1]),
-NOT a per-item group vector.
-
-This auditor therefore supports BOTH:
-  (a) groups=None                     -> infer group of each item from item['a']
-  (b) groups=[0,1,...] (small list)   -> treat as allowed group IDs (filter)
-  (c) groups=per_item_vector (len==len(buffer) or len==len(window)) -> override per-item groups
-
-Implementation details:
-  * equal_mass_buckets() in this repo returns bucket *intervals*: [(lo, hi), ...].
-    Do NOT cast them to floats. Use bucket_index(intervals, value).
-
-Expected fields in each DR buffer item (dict-like):
-  - 'a'      : group id (int)
-  - 'p_hat'  : base score/prob (float)
-  - 'r0'     : residual for calibration gap (float)
-  - 'r_delta': residual for treatment-effect gap (float)
-  - 'w_local': optional locality weight (float, default 1.0)
-  - 'ga_gamma' or 'decay_gamma': optional time-decay gamma (float, default 0.0)
-  - 't_round' or 't': time index used for decay (int/float)
-
-This file is meant to live at:
-  fairlink/copf/oi_audit.py
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -58,46 +11,25 @@ import numpy as np
 from fl_utils.buckets import bucket_index, equal_mass_buckets
 
 
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
+
 @dataclass
 class OIAuditConfig:
-    # Sliding window length over the DR buffer (0 or None => use whole buffer)
     window: int = 40000
-
-    # Discrete auditors: score buckets per group
     buckets_per_group: int = 10
     min_mass: float = 1e-3  # min slice mass; slices smaller than this are ignored
-
-    # Which discrete slice families to include
-    include_group_only: bool = True         # slices keyed by group only
-    include_group_bucket: bool = True       # slices keyed by (group, score-bucket)
-
-    # Optional structural / feature bucket auditors (augment gb slices)
+    include_group_only: bool = True         
+    include_group_bucket: bool = True      
     include_struct: bool = False
     struct_bins: int = 5
-
-    # Keep only the top-B violating slices in diagnostics (does NOT affect eps calculation)
     budget_B: int = 64
-
-    # Any-kernel auditor via Random Fourier Features (RBF)
     rff_dim: int = 0
     rff_gamma: float = 1.0
-
-    # Confidence level for (simple) concentration bounds
     delta: float = 0.05
-
-    # Internal random seed
     seed: int = 123
-
-    # Whether to use GA weights (w_local + time-decay). Keep True for paper alignment.
     use_ga_weights: bool = True
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+
 def _effective_n(w: np.ndarray) -> float:
     """Kish effective sample size for nonnegative weights."""
     w = np.asarray(w, dtype=float)
@@ -129,9 +61,7 @@ def _get_time_key(items: Sequence[Dict[str, Any]]) -> str:
     return "t"
 
 
-# ---------------------------------------------------------------------
-# Auditor
-# ---------------------------------------------------------------------
+
 class ResidualOIAuditor:
     """Residual-OI auditor used by scripts/run_copf.py."""
 
@@ -144,9 +74,7 @@ class ResidualOIAuditor:
         self._rff_b: Optional[np.ndarray] = None
         self._rff_in_dim: Optional[int] = None
 
-    # -----------------
-    # Weighting helpers
-    # -----------------
+    
     def _ga_weights(self, items: Sequence[Dict[str, Any]]) -> Tuple[np.ndarray, float, float]:
         """Return (w, sum_w, n_eff). Uses GA weights if configured & available."""
         n = len(items)
@@ -188,25 +116,13 @@ class ResidualOIAuditor:
 
         return w, sum_w, float(n_eff)
 
-    # -----------------------
-    # Group parsing
-    # -----------------------
+    
     def _parse_groups_arg(
         self,
         items: Sequence[Dict[str, Any]],
         groups: Optional[Sequence[int]],
         full_len: int,
     ) -> Tuple[np.ndarray, Optional[List[int]]]:
-        """
-        Returns:
-          - g_vec: per-item group vector (len == len(items))
-          - group_ids: optional list of allowed group IDs (or None)
-
-        Supported `groups` inputs:
-          - None
-          - per-item vector (len == full_len or len == len(items))
-          - small list of group ids (e.g. [0,1])
-        """
         n = len(items)
         # default: read from items
         g_vec = np.array([int(it.get("a", 0)) for it in items], dtype=int)
@@ -237,9 +153,7 @@ class ResidualOIAuditor:
         group_ids = g_list
         return g_vec, group_ids
 
-    # -----------------------
-    # Discrete (bucket) audit
-    # -----------------------
+    
     def _audit_discrete(
         self,
         items: Sequence[Dict[str, Any]],
@@ -363,9 +277,7 @@ class ResidualOIAuditor:
 
         keys_all = list(sum_w_slice.keys())
 
-        # -----------------------------------------------------------------
-        # Slice masses under GA weights
-        # -----------------------------------------------------------------
+        
         def _mass(k: Tuple[Any, ...]) -> float:
             sw = float(sum_w_slice.get(k, 0.0))
             if sw <= 0.0 or sum_w <= 0.0:
@@ -380,12 +292,7 @@ class ResidualOIAuditor:
                 return True
             return _mass(k) >= min_mass
 
-        # -----------------------------------------------------------------
-        # ε values
-        # -----------------------------------------------------------------
-        # Unconditional: max_k |E_w[ 1{k} r ]|.
-        # IMPORTANT: apply the same min-mass filter to avoid "pmin" being
-        # dominated by vanishing-mass slices that we otherwise ignore.
+        
         eps_uncond = 0.0
         for k in keys_all:
             if not _keep(k):
@@ -412,13 +319,7 @@ class ResidualOIAuditor:
             if denom > 0:
                 eps_cond_g = max(eps_cond_g, abs(sum_w_r_slice[k] / denom))
 
-        # -----------------------------------------------------------------
-        # p_min values
-        # -----------------------------------------------------------------
-        # p_min must be consistent with the min-mass filter used for ε.
-        # Otherwise bound = (ε+β)/p_min can explode even when the tiny-mass
-        # slices are excluded from ε (this was the root cause of the boundCal
-        # blow-ups you observed).
+        
         pmin_gb = 0.0
         if gb_keys:
             masses = [_mass(k) for k in gb_keys if _keep(k) and sum_w_slice[k] > 0.0]
@@ -473,9 +374,7 @@ class ResidualOIAuditor:
             "total_samples": int(n),
         }
 
-    # -----------------------
-    # Any-kernel (RFF) auditor
-    # -----------------------
+    
     def _rff_init(self, in_dim: int) -> None:
         if self._rff_W is not None and self._rff_b is not None and self._rff_in_dim == int(in_dim):
             return
@@ -528,9 +427,7 @@ class ResidualOIAuditor:
         )
         return {"eps": eps, "beta": float(beta), "n_eff": float(n_eff)}
 
-    # -----
-    # Public
-    # -----
+    
     def audit(self, dr_buffer: Sequence[Dict[str, Any]], *, groups: Optional[Sequence[int]] = None) -> Dict[str, Any]:
         full_len = len(dr_buffer)
 
@@ -563,8 +460,7 @@ class ResidualOIAuditor:
             n_eff=n_eff,
         )
 
-        # Bounds (match scripts/run_copf.py expectations)
-        # If p_min is effectively 0 after filtering, the certificate is undefined.
+        
         pmin_gb_raw = float(disc_r0.get("pmin_group_bucket", 0.0))
         pmin_g_raw = float(disc_r_delta.get("pmin_group", 0.0))
 

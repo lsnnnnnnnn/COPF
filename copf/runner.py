@@ -1,7 +1,3 @@
-"""
-COPF Online Prequential Protocol Runner (Algorithm 2)
-Complete implementation aligned with paper specifications
-"""
 from typing import Dict, Any, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import defaultdict

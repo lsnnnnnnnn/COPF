@@ -1,4 +1,3 @@
-#/copf/opp/propensity.py
 from typing import List, Dict, Any
 
 def log_propensities(cands: List[Dict[str, Any]], d: List[int], e: List[float]):

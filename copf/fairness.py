@@ -1,29 +1,3 @@
-# fairness.py
-
-"""Counterfactual fairness metrics for COPF.
-
-This module implements the paper's fairness family G' (Section 7) in the
-practical "Scheme A" form used by this repo:
-
-  - Within-group counterfactual calibration (gCal)
-  - Treatment-effect parity (gTE)
-  - Minimum-effect guard (gMin)
-  - Baseline risk reporting (gRisk)
-
-Important implementation note (alignment with Residual-OI certificates)
-----------------------------------------------------------------------
-The residual-OI certificate in `copf/oi_audit.py` is derived for residuals
-  r(0) = Y(0) - p̂
-  r(Δ) = (Y(1)-Y(0)) - τ(x)
-
-Therefore, for calibration we use the *residual form*:
-  gCal_{s,I} = | E[Y(0) | A=s, p̂∈I] - E[p̂ | A=s, p̂∈I] |
-             = | E[r(0) | A=s, p̂∈I] |
-
-This makes `bound_gCal_max` a direct certificate for `gCal_max` (when both
-are computed on the same slice family and with the same GA weights).
-"""
-
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
@@ -48,7 +22,6 @@ def _get_score(c: Dict[str, Any], default: float = 0.5) -> float:
 
 
 def _pav_isotonic(y: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """Pool-adjacent-violators algorithm (simple isotonic regression)."""
     y = np.asarray(y, float).copy()
     w = np.asarray(w, float).copy()
     if y.size == 0:
@@ -75,14 +48,6 @@ def _pav_isotonic(y: np.ndarray, w: np.ndarray) -> np.ndarray:
 
 
 def _ga_weights_for_items(items: List[Dict[str, Any]], fallback_gamma: float = 0.0) -> np.ndarray:
-    """Return GA weights for a list of DR items.
-
-    This matches `ResidualOIAuditor._ga_weights` semantics:
-      w = w_local * exp(-gamma * (t_max - t_i))
-
-    where gamma is read from the items if available (ga_gamma / decay_gamma),
-    otherwise from `fallback_gamma`.
-    """
     n = len(items)
     if n == 0:
         return np.zeros(0, dtype=float)
@@ -90,8 +55,6 @@ def _ga_weights_for_items(items: List[Dict[str, Any]], fallback_gamma: float = 0
     w_local = np.array([float(it.get("w_local", 1.0)) for it in items], dtype=float)
     w_local = np.where(np.isfinite(w_local), w_local, 0.0)
     w_local = np.maximum(w_local, 0.0)
-
-    # Prefer per-item gamma (set by GraphAwareDR.ingest), fall back to provided.
     g = items[0].get("ga_gamma", items[0].get("decay_gamma", fallback_gamma))
     try:
         gamma = float(g)
@@ -114,7 +77,6 @@ def _ga_weights_for_items(items: List[Dict[str, Any]], fallback_gamma: float = 0
     w = np.where(np.isfinite(w), w, 0.0)
     w = np.maximum(w, 0.0)
 
-    # If degenerate, fall back to uniform.
     if float(np.sum(w)) <= 0.0:
         w = np.ones(n, dtype=float)
     return w
@@ -131,36 +93,25 @@ def gCal(
     arm_for_cal: int = 0,
     ga_mass_filter: bool = True,
 ) -> Dict[Tuple[Any, int], float]:
-    """Within-group counterfactual calibration gaps.
-
-    Scheme A (certificate-aligned):
-        gCal_{s,I} = |E[Y^(a) | A=s, p_hat in I] - E[p_hat | A=s, p_hat in I]|
-
-    Args:
-      batch: list of DR buffer items (as produced by GraphAwareDR.ingest).
-      dr: GraphAwareDR instance (used for config gates like min_eff_samples).
-      groups: list of group IDs.
-      buckets_per_group: number of equal-mass buckets per group.
-      isotonic: if True, apply isotonic smoothing across buckets.
-      min_mass: minimum GA mass for a slice to be considered (certificate alignment).
-      min_per_bucket: minimum raw count for a bucket.
-      arm_for_cal: 0 or 1 (default 0; calibration is defined on Y(0) in the paper).
-      ga_mass_filter: if True, drop slices whose GA mass < min_mass.
-
-    Returns:
-      dict mapping (group, bucket_index) -> gap value.
-    """
+    
     out: Dict[Tuple[Any, int], float] = {}
     if not batch:
         return out
 
     use_arm = int(arm_for_cal) if int(arm_for_cal) in (0, 1) else 0
 
-    # scores and group labels
+    
     arr_scores = np.asarray([_get_score(b, 0.5) for b in batch], dtype=float)
     arr_groups = np.asarray([b.get("a", None) for b in batch], dtype=object)
+    estimator = str(getattr(getattr(dr, "cfg", None), "estimator", "dr") or "dr").strip().lower()
+    if estimator in {"observed", "observed_only", "observed-only", "naive"}:
+        estimator = "obs"
+    if estimator == "obs":
+        arr_d = np.asarray([int(b.get("d", -1)) for b in batch], dtype=int)
+    else:
+        arr_d = None
 
-    # GA weights over the full audit window
+    
     fallback_gamma = float(getattr(getattr(dr, "cfg", None), "decay_gamma", 0.0) or 0.0)
     w_all = _ga_weights_for_items(list(batch), fallback_gamma=fallback_gamma)
     w_all = np.where(np.isfinite(w_all), w_all, 0.0)
@@ -170,7 +121,7 @@ def gCal(
         w_all = np.ones(len(batch), dtype=float)
         sum_w_total = float(np.sum(w_all))
 
-    # DR pseudo-outcomes
+    
     if use_arm == 0:
         arr_gamma = np.asarray(
             [
@@ -199,7 +150,7 @@ def gCal(
         )
     arr_gamma = np.where(np.isfinite(arr_gamma), arr_gamma, 0.0)
 
-    # mirror GraphAwareDR's minimum-effective-samples gate
+    
     min_eff = int(getattr(getattr(dr, "cfg", None), "min_eff_samples", 0) or 0)
     min_eff = max(0, min_eff)
     min_per_bucket = int(max(0, min_per_bucket))
@@ -210,7 +161,7 @@ def gCal(
         if n_s <= 0:
             continue
 
-        # buckets are defined on (unweighted) equal mass within group
+        
         min_mass_local = float(max(float(min_mass), float(min_per_bucket) / float(max(1, n_s))))
         buckets = equal_mass_buckets(arr_scores[mask_s], int(buckets_per_group), min_mass=min_mass_local)
 
@@ -226,6 +177,8 @@ def gCal(
             else:
                 in_bin = (arr_scores >= float(lo)) & (arr_scores < float(hi))
             m = mask_s & in_bin
+            if estimator == "obs" and arr_d is not None:
+                m = m & (arr_d == int(use_arm))
             n = int(np.sum(m))
             if n < max(min_eff, min_per_bucket):
                 continue
@@ -235,7 +188,7 @@ def gCal(
             if not np.isfinite(wsum) or wsum <= 0.0:
                 continue
 
-            # Certificate-aligned slice family: keep only slices with enough GA mass.
+            
             if bool(ga_mass_filter):
                 mass = float(wsum / max(1e-12, sum_w_total))
                 if mass < float(min_mass):
@@ -248,7 +201,7 @@ def gCal(
             W[bi] = wsum
             valid[bi] = True
 
-        # optional isotonic smoothing on Ey across buckets
+        
         if bool(isotonic) and int(np.sum(valid)) >= 2:
             idx = np.where(valid)[0]
             Ey[idx] = _pav_isotonic(Ey[idx], np.maximum(W[idx], 0.0))
@@ -261,30 +214,39 @@ def gCal(
 
 
 def gTE(dr: GraphAwareDR, groups: List[Any]) -> float:
-    """Treatment-effect parity gap: max_s τ_s - min_s τ_s."""
     te = dr.estimate_TE_by_group(group_key="a")
-    vals = [float(v) for (v, n) in te.values() if float(n) > 0]
-    if not vals:
+    vals: List[float] = []
+    for g in groups:
+        if int(g) in te:
+            v, n = te[int(g)]
+            if float(n) > 0.0 and np.isfinite(float(v)):
+                vals.append(float(v))
+    if len(vals) < 2:
         return 0.0
     arr = np.asarray(vals, dtype=float)
     return float(np.max(arr) - np.min(arr))
 
 
-def gMin(dr: GraphAwareDR, tau_min: float = 0.0) -> float:
-    """Minimum effect guard: max_s [tau_min - τ_s]_+."""
+def gMin(dr: GraphAwareDR, tau_min: float = 0.0, groups: List[Any] | None = None) -> float:
     te = dr.estimate_TE_by_group(group_key="a")
+    if groups is None:
+        groups_iter = list(te.keys())
+    else:
+        groups_iter = [int(g) for g in groups]
+
     worst = 0.0
-    for _, (v, n) in te.items():
-        if float(n) > 0:
+    for g in groups_iter:
+        if int(g) not in te:
+            continue
+        v, n = te[int(g)]
+        if float(n) > 0.0 and np.isfinite(float(v)):
             worst = max(worst, max(0.0, float(tau_min) - float(v)))
     return float(worst)
 
 
 def gRisk(dr: GraphAwareDR, groups: List[Any]) -> float:
-    """Baseline risk reporting: max_s E[Y(0)|s] - min_s E[Y(0)|s]."""
     risks: List[float] = []
     for g in groups:
-        # GraphAwareDR.estimate_EY signature: (arm, cond)
         Ey0, n_eff = dr.estimate_EY(arm=0, cond=("a", int(g)))
         if float(n_eff) > 0.0:
             risks.append(float(Ey0))
@@ -293,6 +255,78 @@ def gRisk(dr: GraphAwareDR, groups: List[Any]) -> float:
         return 0.0
     arr = np.asarray(risks, dtype=float)
     return float(np.max(arr) - np.min(arr))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

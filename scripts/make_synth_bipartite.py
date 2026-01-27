@@ -7,10 +7,9 @@ import pandas as pd
 
 
 def stable_softmax(x: np.ndarray) -> np.ndarray:
-    """Numerically stable softmax that returns a valid probability vector."""
     x = np.asarray(x, dtype=np.float64)
     x = np.nan_to_num(x, nan=-1e30, posinf=1e30, neginf=-1e30)
-    x = x - np.max(x)  # stability
+    x = x - np.max(x)  
     ex = np.exp(x)
     ex = np.nan_to_num(ex, nan=0.0, posinf=0.0, neginf=0.0)
     s = float(ex.sum())
@@ -18,7 +17,6 @@ def stable_softmax(x: np.ndarray) -> np.ndarray:
         p = np.full_like(ex, 1.0 / len(ex), dtype=np.float64)
     else:
         p = ex / s
-        # Force exact sum=1 for numpy choice (avoid floating error)
         p[-1] = 1.0 - float(p[:-1].sum())
         if (not np.isfinite(p[-1])) or (p[-1] <= 0.0):
             p = np.full_like(ex, 1.0 / len(ex), dtype=np.float64)
@@ -26,7 +24,6 @@ def stable_softmax(x: np.ndarray) -> np.ndarray:
 
 
 def normalize_probs(p: np.ndarray) -> np.ndarray:
-    """Safe normalize for any nonnegative vector."""
     p = np.asarray(p, dtype=np.float64)
     p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
     p = np.clip(p, 0.0, None)
@@ -50,7 +47,7 @@ def main():
     ap.add_argument("--group_p", type=float, default=0.5, help="P(group=1) for users")
     ap.add_argument("--seed", type=int, default=42)
 
-    # dynamics knobs
+    
     ap.add_argument("--latent_dim", type=int, default=32)
     ap.add_argument("--cand_pool", type=int, default=200, help="candidate items per event (for efficient sampling)")
     ap.add_argument("--alpha_pop", type=float, default=0.75, help="popularity exponent")
@@ -72,22 +69,17 @@ def main():
     n_items = args.n_items
     T = args.n_events
 
-    # ---- user groups (sensitive attribute proxy) ----
     user_group = rng.binomial(1, args.group_p, size=n_users).astype(int)
 
-    # ---- latent factors ----
     U = rng.normal(0, 1.0, size=(n_users, args.latent_dim)).astype(np.float32)
     V = rng.normal(0, 1.0, size=(n_items, args.latent_dim)).astype(np.float32)
 
-    # ---- item popularity state ----
-    item_deg = np.ones(n_items, dtype=np.float64)  # start with 1 to avoid zeros
+    item_deg = np.ones(n_items, dtype=np.float64)  
 
-    # ---- generate event stream ----
     src_users = rng.integers(0, n_users, size=T, dtype=np.int64)
 
-    # strictly increasing time
     dt = rng.integers(1, 5, size=T, dtype=np.int64)
-    t = np.cumsum(dt)  # 1.. increasing
+    t = np.cumsum(dt) 
 
     dst_items = np.empty(T, dtype=np.int64)
 

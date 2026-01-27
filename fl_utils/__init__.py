@@ -1,2 +1,1 @@
-# fl_utils package
-from .utils import NeighborSampler  # noqa: F401
+from .utils import NeighborSampler  

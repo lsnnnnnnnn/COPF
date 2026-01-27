@@ -4,13 +4,6 @@ import math
 import numpy as np
 
 class LocalGraph:
-    """
-    Incremental local graph statistics on G<=t.
-    Maintains adjacency sets and degree; supports per-edge online updates.
-    Provides common link-pred features computed ONLY from past edges.
-    
-    NEW: Tracks neighborhood change rate for locality weights (Paper Sec 5)
-    """
     def __init__(self, change_window: int = 100):
         self.neigh: Dict[int, Set[int]] = defaultdict(set)
         self.deg: Dict[int, int] = defaultdict(int)

@@ -18,5 +18,4 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
     except Exception:
-        # torch not available or CUDA not available; ignore
         pass

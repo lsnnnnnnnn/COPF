@@ -1,4 +1,3 @@
-# fl_utils/utils.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,17 +9,6 @@ import numpy as np
 
 @dataclass
 class NeighborSampler:
-    """
-    Online historical neighbor sampler.
-
-    Stores per-node interaction lists sorted by time:
-      (time, neighbor, edge_id)
-
-    APIs:
-      - insert_edge(src, dst, t, edge_id)  (call AFTER processing an event)
-      - get_historical_neighbors(node_ids, node_interact_times, num_neighbors)
-      - get_temporal_neighbor(node_ids, node_interact_times, num_neighbors)  (alias)
-    """
 
     num_nodes: int
     seed: Optional[int] = 0

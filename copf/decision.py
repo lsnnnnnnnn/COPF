@@ -1,12 +1,7 @@
-"""
-Decision policies with exploration (OPP-2)
-Implements coverage-driven exploration from Section 14.4
-"""
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 
 def softmax(x: np.ndarray, tau: float = 1.0) -> np.ndarray:
-    """Compute softmax with temperature"""
     x = np.asarray(x, dtype=float)
     tau = max(1e-8, float(tau))
     x = x / tau
@@ -19,7 +14,6 @@ def softmax(x: np.ndarray, tau: float = 1.0) -> np.ndarray:
 
 def _plackett_luce_sample_once(scores: np.ndarray, k: int, temperature: float,
                                rng: np.random.Generator) -> List[int]:
-    """Sample k items using Plackett-Luce model"""
     n = int(scores.shape[0])
     remaining = list(range(n))
     s = np.array(scores, dtype=float)
@@ -37,7 +31,6 @@ def _plackett_luce_sample_once(scores: np.ndarray, k: int, temperature: float,
 
 def _entry_probs_pl_mc(scores: np.ndarray, k: int, temperature: float, mc: int,
                        rng: np.random.Generator) -> np.ndarray:
-    """Monte-Carlo estimation of entry probabilities under PL-TopK"""
     n = len(scores)
     k = int(max(0, min(k, n)))
     if k == 0 or n == 0:
@@ -63,24 +56,7 @@ def decide_with_exploration(
     mc_samples: int = 128,
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[List[int], List[float]]:
-    """
-    Make exposure decisions with exploration and log propensities (OPP-2)
     
-    Args:
-        cands: List of candidates with scores
-        policy: "topk_stochastic" or "epsilon_greedy"
-        topk: Number of items to select
-        epsilon: Base exploration rate
-        temperature: Temperature for stochastic selection
-        explore_mask: Boolean mask for forced exploration
-        epsilon_vec: Per-candidate exploration rates (overrides epsilon)
-        mc_samples: Number of Monte Carlo samples for propensity estimation
-        rng: Random number generator
-    
-    Returns:
-        decisions: List[int] - Binary exposure decisions
-        propensities: List[float] - P(D=1|policy) for each candidate
-    """
     assert policy in ("topk_stochastic", "epsilon_greedy"), \
         "policy must be one of {'topk_stochastic','epsilon_greedy'}"
     
@@ -94,11 +70,6 @@ def decide_with_exploration(
     scores = np.array([float(c.get("p_hat", 0.5)) for c in cands], dtype=float)
     topk = int(max(0, min(topk, n)))
     
-    # IMPORTANT (DR correctness): the logged propensities must match the
-    # actual sampling policy. We therefore implement a *single* exploration
-    # rate at the slate level (epsilon_avg). If a caller provides epsilon_vec,
-    # we reduce it to its mean. Per-candidate epsilon requires a different
-    # policy definition and entry-probability computation.
     if epsilon_vec is not None:
         epsilon_vec = np.asarray(epsilon_vec, dtype=float)
         assert epsilon_vec.shape[0] == n, f"epsilon_vec size {epsilon_vec.shape[0]} != n {n}"
@@ -109,7 +80,7 @@ def decide_with_exploration(
     epsilon_avg = float(np.clip(epsilon_avg, 0.0, 1.0))
     temperature = float(max(1e-6, temperature))
     
-    # Exploration pool (candidates marked for exploration)
+    
     idx_all = np.arange(n)
     if explore_mask is not None and explore_mask.dtype == bool and explore_mask.shape[0] == n:
         pool = idx_all[explore_mask]
@@ -120,12 +91,8 @@ def decide_with_exploration(
     entry = np.zeros(n, dtype=float)
     
     if policy == "topk_stochastic":
-        # Plackett-Luce Top-K with exploration
-        
-        # Entry probabilities under PL
         entry_pl = _entry_probs_pl_mc(scores, topk, temperature, mc, rng) if topk > 0 else np.zeros(n, float)
         
-        # Entry probabilities under uniform exploration (only in pool)
         if len(pool) == 0 or topk == 0:
             entry_uni = np.zeros(n, dtype=float)
         else:

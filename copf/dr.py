@@ -1,36 +1,3 @@
-"""fairlink/copf/dr.py
-
-Graph-aware doubly robust (GA-DR) estimation utilities for COPF.
-
-This module maintains an online buffer of candidate dyads and provides
-self-normalized GA-weighted DR plug-in estimates needed for:
-  - within-group counterfactual calibration (gCal)
-  - treatment-effect parity (gTE)
-  - residual-OI auditing certificates (bounds)
-
-Paper-alignment notes
----------------------
-The paper defines counterfactual residuals (Section 6):
-  r(0) = Y(0) - p̂
-  r(Δ) = (Y(1) - Y(0)) - τ(x)
-
-In our implementation:
-  - We estimate Y(a) with the DR score Γ̃(a) (Definition 1 in the paper).
-  - Therefore we use r0_hat := Γ̃(0) - p̂ and r_delta_hat := (Γ̃(1)-Γ̃(0)) - τ(x).
-
-IMPORTANT (TE-parity certificate fix; "method 1")
--------------------------------------------------
-To make the residual-OI certificate for TE-parity match Lemma 2,
-τ(x) must *not* vary across groups in a way that would survive the
-(s1,s2) difference.
-
-This file supports two modes for τ(x):
-  - tau_mode='plugin': τ(x) = μ̂1(x) - μ̂0(x) (x-dependent).
-  - tau_mode='global': τ(x) = τ_global (a global constant / EMA over time).
-
-For TE-parity certificates, prefer tau_mode='global'.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -66,10 +33,11 @@ class DRConfig:
     winsor_eps: float = 0.02
     min_eff_samples: int = 100
 
-    # --- TE target τ(x) options ---
+   
     tau_mode: str = "global"  # ['global', 'plugin']
     tau_ema_alpha: float = 0.02
     tau_init: float = 0.0
+    estimator: str = "dr"
 
 
 class GraphAwareDR:
@@ -81,14 +49,12 @@ class GraphAwareDR:
 
         self.buffer = deque(maxlen=int(config.max_buffer))
 
-        # global τ target (used when tau_mode='global')
+        
         self.tau_global: float = float(config.tau_init)
-        self._tau_valid: bool = True  # even tau_init=0.0 is a valid constant
+        self._tau_valid: bool = True  
         self.last_tau_batch: float = float("nan")
 
-    # -----------------
-    # GA-weight helpers
-    # -----------------
+    
     def _weights(self, cond_mask: np.ndarray) -> Tuple[np.ndarray, float, float]:
         items = list(self.buffer)
         if len(items) == 0:
@@ -124,9 +90,7 @@ class GraphAwareDR:
         n_eff = (sum_w * sum_w) / s2 if s2 > 0.0 else float(len(items))
         return w, sum_w, float(n_eff)
 
-    # -----------------
-    # Nuisance update
-    # -----------------
+    
     def update_nuisance(self, c: Dict[str, Any]) -> Tuple[float, float]:
         """Return (mu0, mu1) for candidate dict c."""
         if self.cross_fitter is None:
@@ -134,12 +98,7 @@ class GraphAwareDR:
             p = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
             return float(p), float(p)
 
-        # ------------------------------
-        # Cross-fitter API compatibility
-        # ------------------------------
-        # Different versions of the repo expose nuisance predictions under
-        # different method names. Prefer predict_mu() if available; otherwise
-        # fall back to predict_outcome()/get_predictions_batch().
+        
         t = c.get("t_round", c.get("t", None))
         try:
             t_int = int(t) if t is not None else None
@@ -161,31 +120,41 @@ class GraphAwareDR:
             mu1 = float(np.asarray(preds.get("mu_1"))[0])
             return float(mu0), float(mu1)
 
-        # Last-resort fallback
+        
         p = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
         return float(p), float(p)
 
-    # -----------------
-    # Online ingest
-    # -----------------
+    
     def ingest(self, batch: Sequence[Dict[str, Any]]) -> None:
-        """Ingest a single round's candidate set into the DR buffer."""
         if not batch:
             return
+
+        estimator = str(getattr(self.cfg, "estimator", "dr") or "dr").strip().lower()
+        # allow a couple common aliases
+        if estimator in {"doubly_robust", "doubly-robust"}:
+            estimator = "dr"
+        if estimator in {"ipw", "ips", "iw"}:
+            estimator = "ips"
+        if estimator in {"observed", "observed_only", "observed-only", "naive"}:
+            estimator = "obs"
+        if estimator not in {"dr", "ips", "obs"}:
+            estimator = "dr"
 
         tau_mode = str(getattr(self.cfg, "tau_mode", "global") or "global").strip().lower()
         if tau_mode not in {"global", "plugin"}:
             tau_mode = "global"
 
-        # For tau_mode='global', τ(x) is a constant at this round.
+        
         tau_for_resid = float(self.tau_global) if self._tau_valid else float(self.cfg.tau_init)
 
-        # Track a batch-level TE estimate to update τ_global (EMA) if enabled
         batch_w_sum = 0.0
         batch_te_num = 0.0
+        batch_w1 = 0.0
+        batch_y1 = 0.0
+        batch_w0 = 0.0
+        batch_y0 = 0.0
 
         for c in batch:
-            # Required fields
             a = int(c.get("a", 0))
             p_hat = winsorize01(float(c.get("p_hat", 0.5)), self.cfg.winsor_eps)
 
@@ -203,7 +172,7 @@ class GraphAwareDR:
             except Exception:
                 t_round = 0
 
-            # Nuisance predictions
+            
             mu0, mu1 = self.update_nuisance(c)
             mu0 = float(mu0); mu1 = float(mu1)
             if not np.isfinite(mu0):
@@ -211,36 +180,48 @@ class GraphAwareDR:
             if not np.isfinite(mu1):
                 mu1 = p_hat
 
-            # Propensity clipping
+            
             clip = float(self.cfg.clip)
-            e1 = winsorize01(e_hat, clip)
-            e0 = winsorize01(1.0 - e_hat, clip)
+            e1_raw = float(e_hat)
+            e0_raw = float(1.0 - e_hat)
+            e1 = winsorize01(e1_raw, clip)
+            e0 = winsorize01(e0_raw, clip)
             if bool(self.cfg.ratio_stab):
                 e1 = ratio_stabilize(e1, clip)
                 e0 = ratio_stabilize(e0, clip)
 
-            # DR scores
             ind1 = 1.0 if d == 1 else 0.0
             ind0 = 1.0 if d == 0 else 0.0
-            gamma1 = mu1 - (ind1 / e1) * (mu1 - y)
-            gamma0 = mu0 - (ind0 / e0) * (mu0 - y)
+            if estimator == "dr":
+                gamma1 = mu1 - (ind1 / e1) * (mu1 - y)
+                gamma0 = mu0 - (ind0 / e0) * (mu0 - y)
+            elif estimator == "ips":
+                gamma1 = (ind1 / e1) * y
+                gamma0 = (ind0 / e0) * y
+            else:
+                gamma1 = y
+                gamma0 = y
 
-            # τ(x) target
             if tau_mode == "global":
                 tau_x = tau_for_resid
             else:
-                # x-dependent plug-in target
                 tau_x = float(mu1 - mu0)
 
-            # counterfactual residuals (DR plug-ins)
             r0 = float(gamma0 - p_hat)
-            r_delta = float((gamma1 - gamma0) - tau_x)
+            if estimator == "obs":
+                r_delta = 0.0
+            else:
+                r_delta = float((gamma1 - gamma0) - tau_x)
 
             item = {
                 "a": a,
                 "p_hat": p_hat,
                 "d": d,
                 "e_hat": float(e_hat),
+                "e1": float(e1),
+                "e0": float(e0),
+                "e1_raw": float(e1_raw),
+                "e0_raw": float(e0_raw),
                 "y": y,
                 "mu0": mu0,
                 "mu1": mu1,
@@ -250,9 +231,6 @@ class GraphAwareDR:
                 "r_delta": r_delta,
                 "tau_x": float(tau_x),
                 "w_local": w_local,
-                # Provide GA time-decay gamma explicitly so that external
-                # auditors (ResidualOIAuditor) can use the *same* GA weights
-                # as GraphAwareDR when computing certificates.
                 "ga_gamma": float(getattr(self.cfg, "decay_gamma", 0.0) or 0.0),
                 "decay_gamma": float(getattr(self.cfg, "decay_gamma", 0.0) or 0.0),
                 "t_round": t_round,
@@ -261,37 +239,37 @@ class GraphAwareDR:
             }
             self.buffer.append(item)
 
-            # batch TE estimate for τ_global update
             batch_w_sum += w_local
-            batch_te_num += w_local * float(gamma1 - gamma0)
+            if estimator == "obs":
+                batch_w1 += w_local * ind1
+                batch_y1 += w_local * ind1 * float(y)
+                batch_w0 += w_local * ind0
+                batch_y0 += w_local * ind0 * float(y)
+            else:
+                batch_te_num += w_local * float(gamma1 - gamma0)
 
-        # Update τ_global (EMA over rounds) if tau_mode='global'
-        if tau_mode == "global" and batch_w_sum > 0.0 and np.isfinite(batch_te_num):
-            tau_batch = float(batch_te_num / batch_w_sum)
+        if tau_mode == "global" and batch_w_sum > 0.0:
+            if estimator == "obs":
+                if batch_w1 > 0.0 and batch_w0 > 0.0:
+                    tau_batch = float(batch_y1 / batch_w1) - float(batch_y0 / batch_w0)
+                else:
+                    tau_batch = 0.0
+            else:
+                if not np.isfinite(batch_te_num):
+                    return
+                tau_batch = float(batch_te_num / batch_w_sum)
             self.last_tau_batch = tau_batch
 
             alpha = float(getattr(self.cfg, "tau_ema_alpha", 0.0) or 0.0)
             alpha = float(max(0.0, min(1.0, alpha)))
             if alpha <= 0.0:
-                # constant τ_global
                 pass
             else:
-                # EMA update
                 self.tau_global = float((1.0 - alpha) * float(self.tau_global) + alpha * tau_batch)
                 self._tau_valid = True
 
-    # -----------------
-    # Plug-in estimates
-    # -----------------
+    
     def estimate_EY(self, arm: int, cond: Optional[Tuple[str, int]] = None) -> Tuple[float, float]:
-        """Estimate E[Y(arm) | cond] with GA weights.
-
-        Returns (estimate, n_eff).
-
-        cond options:
-          - None
-          - ("a", group_id) condition on protected group
-        """
         items = list(self.buffer)
         if len(items) == 0:
             return 0.0, 0.0
@@ -304,6 +282,15 @@ class GraphAwareDR:
                 cond_mask = np.array([1.0 if int(it.get("a", 0)) == int(val) else 0.0 for it in items], dtype=float)
             else:
                 cond_mask = np.ones(len(items), dtype=float)
+
+        
+        estimator = str(getattr(self.cfg, "estimator", "dr") or "dr").strip().lower()
+        if estimator in {"observed", "observed_only", "observed-only", "naive"}:
+            estimator = "obs"
+        if estimator == "obs":
+            a_arm = 1 if int(arm) == 1 else 0
+            d_mask = np.array([1.0 if int(it.get("d", 0)) == a_arm else 0.0 for it in items], dtype=float)
+            cond_mask = cond_mask * d_mask
 
         w, sum_w, n_eff = self._weights(cond_mask)
         if sum_w <= 0.0 or n_eff < float(self.cfg.min_eff_samples):
@@ -319,7 +306,6 @@ class GraphAwareDR:
         return est, float(n_eff)
 
     def estimate_TE_by_group(self, group_key: str = "a") -> Dict[int, Tuple[float, float]]:
-        """Return {group: (TE_hat, n_eff)} using GA-DR plug-ins."""
         items = list(self.buffer)
         if not items:
             return {}
@@ -335,7 +321,6 @@ class GraphAwareDR:
         return out
 
     def diagnostics(self) -> Dict[str, float]:
-        """Lightweight diagnostics for logging."""
         tau_mode = str(getattr(self.cfg, "tau_mode", "global") or "global").strip().lower()
         return {
             "tau_mode_global": 1.0 if tau_mode == "global" else 0.0,

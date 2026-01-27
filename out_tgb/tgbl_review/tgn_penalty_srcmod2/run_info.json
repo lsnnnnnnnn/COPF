@@ -1,9 +1,0 @@
-{
-  "dataset": "tgb",
-  "model": "TGN(adv=0.0, reweight=none, pen=1.0)",
-  "T": 2000,
-  "neg": 200,
-  "hits_k": 10,
-  "seed": 42,
-  "tgb_root": "/data1/shengen/fairlink/tgb_baselines"
-}

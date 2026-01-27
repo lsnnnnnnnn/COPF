@@ -1,4 +1,3 @@
-# copf/opp/eval.py
 from typing import List, Dict, Any, Tuple, Optional
 import math
 import json
@@ -6,13 +5,11 @@ import numpy as np
 import pandas as pd
 import os
 
-# ---------- Utility: Deterministic tie-breaking ----------
+
 def _stable_hash(u: int, v: int, t: int) -> int:
-    """Low-collision, reproducible hash for tie-breaking"""
     return ((u * 1000003) ^ (v * 0x9E3779B1) ^ (t * 0x85EBCA6B)) & 0xFFFFFFFF
 
 def _sorted_by_score(cands: List[Dict[str, Any]]):
-    """Sort by score with deterministic tie-breaking"""
     return sorted(
         cands,
         key=lambda c: (
@@ -22,10 +19,9 @@ def _sorted_by_score(cands: List[Dict[str, Any]]):
     )
 
 def _labels(cands: List[Dict[str, Any]]):
-    """Extract evaluation labels"""
     return [int(c.get("y_eval", c.get("y_true", 0))) for c in cands]
 
-# ---------- Online ranking metrics ----------
+
 def average_precision(cands: List[Dict[str, Any]]) -> float:
     if not cands:
         return 0.0
@@ -51,7 +47,6 @@ def mrr(cands: List[Dict[str, Any]]) -> float:
     return 0.0
 
 def hits_at_k(cands: List[Dict[str, Any]], k: int) -> float:
-    """Returns 1.0 if at least one positive is in top-k"""
     if not cands or k <= 0:
         return 0.0
     ranked = _sorted_by_score(cands)[:k]
@@ -61,22 +56,15 @@ def hits_at_k(cands: List[Dict[str, Any]], k: int) -> float:
 
 
 def recall_at_k(cands: List[Dict[str, Any]], k: int) -> float:
-    """Fraction of all positives IN THIS BATCH that appear in top-k"""
     if not cands or k <= 0:
         return 0.0
     
-    # Count positives in THIS batch only
     npos = sum(1 for c in cands if c.get("y_eval", c.get("y_true", 0)) > 0)
     if npos == 0:
         return 0.0
     
-    # Get top-k candidates
     ranked = _sorted_by_score(cands)[:k]
-    
-    # Count positives in top-k
     hit = sum(1 for c in ranked if c.get("y_eval", c.get("y_true", 0)) > 0)
-    
-    # Recall = positives_in_topk / total_positives_in_batch
     recall = float(hit) / float(npos)
     
     return recall
@@ -89,33 +77,28 @@ def ndcg_at_k(cands: List[Dict[str, Any]], k: int) -> float:
     if not cands or k <= 0:
         return 0.0
     
-    # Get labels for all candidates
     all_labels = _labels(cands)
     n_pos = sum(all_labels)
     
     if n_pos == 0:
         return 0.0
     
-    # Get top-k ranked candidates
     ranked = _sorted_by_score(cands)[:k]
     
-    # Compute DCG
     dcg = 0.0
     for i, c in enumerate(ranked):
         rel = float(c.get("y_eval", c.get("y_true", 0)))
         if rel > 0:
             dcg += 1.0 / math.log2(i + 2.0)
     
-    # Compute IDCG (all positives at the top)
     idcg = 0.0
     for i in range(min(k, n_pos)):
         idcg += 1.0 / math.log2(i + 2.0)
     
     return float(dcg / idcg) if idcg > 0 else 0.0
 
-# ---------- Diagnostic metrics ----------
+
 def compute_score_distribution(cands: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Compute score distribution statistics for debugging"""
     if not cands:
         return {}
     
@@ -135,19 +118,12 @@ def compute_score_distribution(cands: List[Dict[str, Any]]) -> Dict[str, float]:
         stats["neg_min"] = float(np.min(neg_scores))
         stats["neg_max"] = float(np.max(neg_scores))
         
-    # Score separation
     if pos_scores and neg_scores:
         stats["score_separation"] = stats["pos_mean"] - stats["neg_mean"]
         
     return stats
 
-# ---------- Deployment stability metrics ----------
 def compute_deltas(pre_fair: Dict[str, Any], post_fair: Dict[str, Any]) -> Tuple[float, float]:
-    """
-    Compute deployment stability metrics:
-    - Δ_drift: max absolute change in fairness metrics
-    - Δ_eff: average treatment effect change
-    """
     keys = ["gCal_max", "gTE_gap", "gMin"]
     drift = max(abs(float(post_fair.get(k, 0.0)) - float(pre_fair.get(k, 0.0))) for k in keys)
     
@@ -162,10 +138,6 @@ def compute_deltas(pre_fair: Dict[str, Any], post_fair: Dict[str, Any]) -> Tuple
     return float(drift), float(delta_eff)
 
 def tau_bands_json(tau_by_group: Dict[Any, Dict[str, float]], z: float = 1.96) -> str:
-    """
-    Confidence bands for treatment effects: τ ± z * sqrt(0.5/n_eff)
-    Returns JSON string for CSV export
-    """
     out = {}
     for g, d in tau_by_group.items():
         if isinstance(d, dict):
@@ -181,10 +153,6 @@ def tau_bands_json(tau_by_group: Dict[Any, Dict[str, float]], z: float = 1.96) -
     return json.dumps(out, ensure_ascii=False, sort_keys=True)
 
 def export_phase_results(phase_results: Dict[str, Any], out_dir: str):
-    """
-    Export phase results to summary.csv for analysis
-    Format matches paper's evaluation protocol (Sec 13)
-    """
     os.makedirs(out_dir, exist_ok=True)
     rows = []
     
@@ -213,7 +181,6 @@ def export_phase_results(phase_results: Dict[str, Any], out_dir: str):
         }
         rows.append(row)
         
-    # Compute deployment drift
     if "pre" in phase_results and "post" in phase_results:
         drift, eff = compute_deltas(
             phase_results["pre"]["fairness"],
@@ -230,7 +197,6 @@ def export_phase_results(phase_results: Dict[str, Any], out_dir: str):
         }
         rows.append(summary_row)
         
-    # Export to CSV
     if rows:
         df = pd.DataFrame(rows)
         csv_path = os.path.join(out_dir, "summary.csv")

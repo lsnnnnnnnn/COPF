@@ -1,7 +1,3 @@
-"""
-Online Cross-Fitting for GA-DR Nuisance Functions
-Implements Section 5 of the paper with K-fold cross-fitting
-"""
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from sklearn.linear_model import LogisticRegression, Ridge
@@ -11,10 +7,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 class OnlineCrossFitter:
-    """
-    Online K-fold cross-fitting for nuisance functions (ê, μ̂₀, μ̂₁)
-    Required for unbiased GA-DR estimation (Lemma 1)
-    """
+    
     
     def __init__(self, n_folds: int = 5, seed: int = 42, max_buffer: int = 20000):
         self.n_folds = n_folds
@@ -63,14 +56,9 @@ class OnlineCrossFitter:
         self.model_ready = [False] * n_folds
         
     def get_fold(self, t: int) -> int:
-        """Assign time step to fold (interleaved assignment)"""
         return t % self.n_folds
     
     def extract_features(self, c: Dict[str, Any]) -> np.ndarray:
-        """
-        Extract features from candidate including graph structure
-        Combines (ϕ_t, G_local_t) as per Definition 1
-        """
         x = c.get("x", {})
         
         features = [
@@ -96,19 +84,7 @@ class OnlineCrossFitter:
         return np.array(features)
     
     def update(self, cands: List[Dict[str, Any]], train: bool = True):
-        """
-        Update nuisance models with new batch
-        Implements online cross-fitting protocol
-
-        Parameters
-        ----------
-        cands:
-            New candidate batch to ingest into the training buffer.
-        train:
-            If False, this call only ingests into the FIFO buffer and returns
-            (useful to amortize expensive re-training). If True, this call
-            ingests and then fits/refreshes the nuisance models.
-        """
+        
         if not cands:
             return
         
@@ -203,7 +179,7 @@ class OnlineCrossFitter:
                             Y1_train,
                             sample_weight=W_train
                         )
-                else:  # Real data
+                else:  
                     mask_0 = (D_train == 0)
                     mask_1 = (D_train == 1)
                     if mask_0.sum() > 10:
@@ -223,22 +199,16 @@ class OnlineCrossFitter:
                 
 
             except Exception as e:
-                # Continue with defaults if training fails
                 pass
         
         self.t += 1
     
     def predict_propensity(self, c: Dict[str, Any], t: Optional[int] = None) -> float:
-        """
-        Predict ê(x, G_local) using appropriate fold's model
-        Returns clipped propensity to ensure overlap (Assumption 1)
-        """
         if t is None:
             t = self.t
         
         fold = self.get_fold(t)
         
-        # Use recorded propensity if model not ready
         if not self.model_ready[fold]:
             return float(c.get("e_hat", 0.5))
         
@@ -249,13 +219,9 @@ class OnlineCrossFitter:
             prob = self.propensity_models[fold].predict_proba(features_scaled)[0, 1]
             return float(prob)
         except:
-            # Fallback to recorded propensity
             return float(c.get("e_hat", 0.5))
     
     def predict_outcome(self, c: Dict[str, Any], arm: int, t: Optional[int] = None) -> float:
-        """
-        Predict μ̂_a(x, G_local) for arm a ∈ {0, 1}
-        """
         if t is None:
             t = self.t
         
@@ -289,15 +255,7 @@ class OnlineCrossFitter:
                 return min(1.0, base * 1.2)
             return base
 
-    # ------------------------------------------------------------------
-    # Compatibility aliases
-    # ------------------------------------------------------------------
-    # Some parts of the COPF pipeline expect a cross-fitter API that
-    # provides a single call returning both nuisance outcomes (mu0, mu1)
-    # and, occasionally, an alias for propensity prediction.
-    #
-    # The original OnlineCrossFitter exposes predict_outcome() and
-    # predict_propensity(); we provide thin wrappers for compatibility.
+    
     def predict_mu(self, c: Dict[str, Any], t: Optional[int] = None) -> Tuple[float, float]:
         """Return (mu0, mu1) for candidate c."""
         mu0 = self.predict_outcome(c, arm=0, t=t)
@@ -305,18 +263,9 @@ class OnlineCrossFitter:
         return float(mu0), float(mu1)
 
     def predict_e(self, c: Dict[str, Any], t: Optional[int] = None) -> float:
-        """Alias for propensity prediction."""
         return float(self.predict_propensity(c, t=t))
     
     def get_predictions_batch(self, cands: List[Dict[str, Any]], t: Optional[int] = None) -> Dict[str, np.ndarray]:
-        """
-        Get batch predictions for efficiency
-        Returns: {
-            'e_hat': propensity predictions,
-            'mu_0': outcome predictions for D=0,
-            'mu_1': outcome predictions for D=1
-        }
-        """
         if t is None:
             t = self.t
         
@@ -337,7 +286,6 @@ class OnlineCrossFitter:
         }
     
     def get_model_diagnostics(self) -> Dict[str, Any]:
-        """Get diagnostic information about models"""
         diag = {
             'n_folds': self.n_folds,
             'buffer_size': len(self.buffer),

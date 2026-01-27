@@ -12,10 +12,6 @@ def _finite_unit(scores: np.ndarray) -> np.ndarray:
     return np.clip(s, 0.0, 1.0)
 
 def equal_mass_buckets(scores: np.ndarray, n_buckets: int, min_mass: float = 0.02) -> List[Bucket]:
-    """
-    Equal-mass buckets on [0,1]. Robust to NaN/Inf and degenerate distributions.
-    Will merge buckets whose empirical mass < min_mass.
-    """
     s = _finite_unit(scores)
     if s.size == 0:
         return [(0.0, 1.0)]

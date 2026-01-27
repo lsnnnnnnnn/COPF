@@ -1,7 +1,3 @@
-"""
-Multicalibration with Active Auditor Selection
-Implements Section 9 and Algorithm 2 Line 9
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,32 +19,15 @@ def _sigmoid(z: float) -> float:
 @dataclass
 class AuditorConfig:
     buckets_per_group: int = 10
-    isotonic: bool = True  # 先保留开关；目前 offsets 更新用的是 logit-shift
+    isotonic: bool = True  
     budget_B: int = 64
     step: float = 0.25
     min_mass: float = 0.02
-
-    # Safety: cap logit-offset magnitude to avoid numerical blow-ups when
-    # using aggressive steps (e.g., λCal-scaled updates).
     offset_clip: float = 5.0
-
-    # Learning-rate normalization.
-    #
-    # We want the calibrator to keep adapting in nonstationary online settings
-    # (temporal graphs drift). A purely cumulative 1/sqrt(count) schedule tends
-    # to freeze the calibrator after a few thousand samples, even if fairness
-    # violations re-emerge later.
-    #
-    # We therefore normalize by the *current batch size* only, with a reference
-    # count `lr_ref_n`: for buckets with >= lr_ref_n residual samples in the
-    # current update, we downscale the learning rate as 1/sqrt(n/lr_ref_n);
-    # otherwise we keep lr at the base step. This keeps lr <= base_step and
-    # prevents both explosion (small n) and freezing (large cumulative n).
     lr_ref_n: int = 200
 
 
 class ActiveAuditorSet:
-    """Maintains active set H^act of most violated auditors"""
 
     def __init__(self, budget: int = 64):
         self.budget = int(budget)
@@ -56,7 +35,6 @@ class ActiveAuditorSet:
         self.violation_scores: Dict[Tuple[Any, int], float] = {}
 
     def update(self, violations: Dict[Tuple[Any, int], float]) -> None:
-        """Update active set with top-B violated auditors"""
         for key, viol in violations.items():
             self.violation_scores[key] = abs(float(viol))
 
@@ -72,10 +50,6 @@ class ActiveAuditorSet:
 
 
 class MultiCalibrator:
-    """
-    Multi-calibration with counterfactual residuals
-    Uses residual OI: r^(0) = Y^(0) - p_hat
-    """
 
     def __init__(self, cfg: AuditorConfig, active_set: Optional[ActiveAuditorSet] = None):
         self.cfg = cfg
@@ -93,14 +67,12 @@ class MultiCalibrator:
         self.total_samples = 0
 
     def conf_radius(self) -> float:
-        """β_t ~ sqrt(log |H| / t)"""
         if self.total_samples <= 0:
             return 1.0
         H_size = max(2, len(self.edges_by_group) * max(1, self.cfg.buckets_per_group))
         return float(np.sqrt(np.log(H_size) / float(self.total_samples)))
 
     def apply(self, cands: List[Dict[str, Any]]) -> None:
-        """Apply calibration offsets to candidates (before decision)."""
         for c in cands:
             p = float(c.get("p_hat", 0.5))
             g = c.get("a", None)
@@ -134,19 +106,15 @@ class MultiCalibrator:
         dr_clip: float = 0.02,
         step_scale: float = 1.0,
     ) -> None:
-        """
-        Update calibration using counterfactual residuals.
-        Default uses arm=0 residuals: r0 = Y^(0) - p_hat
-        """
+        
         if not cands or dr is None or not getattr(dr, "buffer", None):
             return
 
         self.total_samples += len(cands)
 
-        # Group candidates by (group, bucket) based on current p_hat distribution
         buckets_data = self._group_by_buckets(cands)
 
-        lookup = self._dr_lookup(dr)  # dict: (u,v,t)->buffer_item
+        lookup = self._dr_lookup(dr) 
 
         violations: Dict[Tuple[Any, int], float] = {}
 
@@ -163,14 +131,10 @@ class MultiCalibrator:
 
                 p = float(c.get("p_hat", 0.5))
 
-                # prefer_arm 保留接口：现在默认用 gamma_0 / r0
                 if prefer_arm == 1:
-                    # treated residual: Y^(1) - p_hat (如果你 dr.buffer 里有 r1/gamma_1)
                     y1_est = float(it.get("gamma_1", it.get("mu1_hat", 0.5)))
                     r = y1_est - p
                 else:
-                    # control residual
-                    # 优先用 r0（更直接），否则 gamma_0 - p
                     r = float(it.get("r0", float(it.get("gamma_0", it.get("mu0_hat", 0.5))) - p))
 
                 if dr_clip is not None:
@@ -185,13 +149,10 @@ class MultiCalibrator:
             violations[(g, bidx)] = avg_r
 
             key = (g, bidx)
-            # Track cumulative samples for diagnostics only.
             self.counts[key] = int(self.counts.get(key, 0) + len(residuals))
 
-            # Learning rate: batch-size normalized (see AuditorConfig.lr_ref_n).
             base_step = float(self.cfg.step) * float(max(0.0, step_scale))
             ref_n = float(max(1, int(getattr(self.cfg, "lr_ref_n", 200))))
-            # lr <= base_step, and decays as 1/sqrt(n/ref_n) for large buckets.
             lr = float(base_step / np.sqrt(max(1.0, float(len(residuals)) / ref_n)))
             new_off = float(self.offsets.get(key, 0.0) + lr * avg_r)
             if float(self.cfg.offset_clip) > 0:
@@ -202,7 +163,6 @@ class MultiCalibrator:
             self.active_set.update(violations)
 
     def _group_by_buckets(self, cands: List[Dict[str, Any]]) -> Dict[Tuple[Any, int], List[Dict[str, Any]]]:
-        """Group candidates by (group, score_bucket) using equal-mass buckets per group."""
         result: Dict[Tuple[Any, int], List[Dict[str, Any]]] = {}
 
         groups = list({c.get("a") for c in cands})
@@ -224,7 +184,6 @@ class MultiCalibrator:
         return result
 
     def compute_violations(self, cands: List[Dict[str, Any]], dr, prefer_arm: int = 0, dr_clip: float = 0.02) -> Dict[Tuple[Any, int], float]:
-        """Compute residual violations for all auditors (no parameter update)."""
         if not cands or dr is None or not getattr(dr, "buffer", None):
             return {}
 
@@ -259,7 +218,6 @@ class MultiCalibrator:
         return violations
 
     def _dr_lookup(self, dr) -> Dict[Tuple[Any, Any, Any], Dict[str, Any]]:
-        """Build a lookup map from DR buffer items: (u,v,t)->item."""
         m: Dict[Tuple[Any, Any, Any], Dict[str, Any]] = {}
         buf = getattr(dr, "buffer", None)
         if not buf:
@@ -276,10 +234,7 @@ class MultiCalibrator:
         dr_clip: float = 0.02,
         step_scale: float = 1.0,
     ) -> None:
-        """
-        Alternative update route: update buckets + offsets directly from DR buffer residuals.
-        Useful when you want calibrator driven purely by DR history rather than per-step cands.
-        """
+        
         buf = getattr(dr, "buffer", None)
         if not buf:
             return
@@ -293,7 +248,6 @@ class MultiCalibrator:
 
         self.total_samples += len(items)
 
-        # refresh edges per group using p_hat distribution in buffer
         groups = list({it.get("a") for it in items})
         for g in groups:
             g_items = [it for it in items if it.get("a") == g]
@@ -327,10 +281,8 @@ class MultiCalibrator:
             avg_r = float(np.mean(rs))
             violations[key] = avg_r
 
-            # Track cumulative samples for diagnostics only.
             self.counts[key] = int(self.counts.get(key, 0) + len(rs))
 
-            # Learning rate: batch-size normalized (see AuditorConfig.lr_ref_n).
             base_step = float(self.cfg.step) * float(max(0.0, step_scale))
             ref_n = float(max(1, int(getattr(self.cfg, "lr_ref_n", 200))))
             lr = float(base_step / np.sqrt(max(1.0, float(len(rs)) / ref_n)))
