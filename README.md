@@ -99,6 +99,6 @@ python -u scripts/run_copf.py \
   author    = {Li, Sheng'en and Zou, Dongmian},
   booktitle = {Proceedings of the 43rd International Conference on Machine Learning},
   year      = {2026},
-  note      = {Paper link to be added once available}
+  note      = {https://openreview.net/forum?id=2Nfr4u3pK2}
 }
 ```
